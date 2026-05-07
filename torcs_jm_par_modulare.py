@@ -1,4 +1,3 @@
-
 import socket
 import sys
 import getopt
@@ -444,52 +443,97 @@ def destringify(s):
 
 import math
 
+import math
+
 # ================= USER CONFIGURABLE PARAMETERS =================
-TARGET_SPEED = 100  # Target speed in km/h. Increasing this makes the car go faster but may reduce stability.
-STEER_GAIN = 30     # Steering sensitivity. Higher values make the car turn more aggressively.
-CENTERING_GAIN = 0.20  # How strongly the car corrects its position toward the center of the track.
-BRAKE_THRESHOLD = 0.9  # Angle threshold for braking. Lower values brake earlier.
-GEAR_SPEEDS = [0, 20, 40, 80, 100, 180]  # Speed thresholds for gear shifting.
-ENABLE_TRACTION_CONTROL = True  # Toggle traction control system.
+TARGET_SPEED = 300 
+STEER_GAIN = 15        # Ridotto leggermente per evitare oscillazioni
+CENTERING_GAIN = 0.3   
+BRAKE_THRESHOLD = 0.1  
+GEAR_SPEEDS = [0, 50, 90, 130, 170, 210] 
+ENABLE_TRACTION_CONTROL = True
 
 # ================= HELPER FUNCTIONS =================
+
 def calculate_steering(S):
+    # Prova a stare al centro, ma dai molta importanza all'angolo della pista
     steer = (S['angle'] * STEER_GAIN / math.pi) - (S['trackPos'] * CENTERING_GAIN)
     return max(-1, min(1, steer))
 
-def calculate_throttle(S, R):
-    if S['speedX'] < TARGET_SPEED - (R['steer'] * 2.5):
-        accel = min(1.0, R['accel'] + 0.4)
-    else:
-        accel = max(0.0, R['accel'] - 0.2)
-    if S['speedX'] < 10:
-        accel += 1 / (S['speedX'] + 0.1)
-    return max(0.0, min(1.0, accel))
+def calculate_speed_logic(S):
+    """
+    Gestisce congiuntamente accelerazione e frenata guardando avanti.
+    """
+    speed = S['speedX']
+    # Il sensore 9 è quello che guarda dritto davanti alla macchina
+    # I sensori da 0 a 18 coprono un arco di 180 gradi davanti all'auto
+    dist_ahead = S['track'][9] 
+    
+    # Calcoliamo una velocità di sicurezza basata sulla distanza rilevata davanti
+    # Se la strada è libera (dist > 150m), punta a TARGET_SPEED.
+    # Se c'è una curva (dist bassa), riduci drasticamente la velocità target.
+    safe_speed = TARGET_SPEED
+    if dist_ahead < 100:
+        # Esempio: se vedo solo 50 metri, la mia velocità target scende drasticamente
+        safe_speed = dist_ahead * 2.0 + 20 
 
-def apply_brakes(S):
-    return 0.3 if abs(S['angle']) > BRAKE_THRESHOLD else 0.0
+    accel = 0.0
+    brake = 0.0
+
+    if speed < safe_speed:
+        # Accelera se siamo sotto la velocità di sicurezza
+        accel = 1.0 if speed < 100 else 0.6
+        brake = 0.0
+    else:
+        # Frena se siamo sopra la velocità di sicurezza
+        accel = 0.0
+        # Più siamo veloci rispetto al limite di sicurezza, più freniamo forte
+        brake = min(1.0, (speed - safe_speed) / 50.0)
+
+    # Frenata di emergenza basata sull'angolo (se stiamo già sterzando molto)
+    if abs(S['angle']) > 0.2 and speed > 80:
+        brake = max(brake, 0.4)
+
+    return accel, brake
 
 def shift_gears(S):
     gear = 1
-    for i, speed in enumerate(GEAR_SPEEDS):
-        if S['speedX'] > speed:
+    # Scalata: se la velocità scende, scala marcia
+    speed = S['speedX']
+    for i, threshold in enumerate(GEAR_SPEEDS):
+        if speed > threshold:
             gear = i + 1
-    return min(gear, 6)
+    return gear
 
 def traction_control(S, accel):
     if ENABLE_TRACTION_CONTROL:
-        if ((S['wheelSpinVel'][2] + S['wheelSpinVel'][3]) - (S['wheelSpinVel'][0] + S['wheelSpinVel'][1])) > 2:
-            accel -= 0.1
+        # Se le ruote posteriori girano molto più veloce delle anteriori
+        slip = (S['wheelSpinVel'][2] + S['wheelSpinVel'][3]) - (S['wheelSpinVel'][0] + S['wheelSpinVel'][1])
+        if slip > 5:
+            accel -= 0.3
     return max(0.0, accel)
 
 # ================= MAIN DRIVE FUNCTION =================
 def drive_modular(c):
     S, R = c.S.d, c.R.d
+    
+    # 1. Calcolo Sterzo
     R['steer'] = calculate_steering(S)
-    R['accel'] = calculate_throttle(S, R)
-    R['brake'] = apply_brakes(S)
-    R['accel'] = traction_control(S, R['accel'])
+    
+    # 2. Calcolo Velocità (Accel e Brake insieme per evitare conflitti)
+    accel, brake = calculate_speed_logic(S)
+    
+    # 3. Applicazione controlli
+    R['accel'] = traction_control(S, accel)
+    R['brake'] = brake
+    
+    # 4. Cambio marcia
     R['gear'] = shift_gears(S)
+    
+    # Assicuriamoci che se freniamo, non acceleriamo (molti server TORCS lo richiedono)
+    if R['brake'] > 0:
+        R['accel'] = 0
+        
     return
 
 # ================= MAIN LOOP =================
