@@ -435,112 +435,155 @@ def destringify(s):
         else:
             return [destringify(i) for i in s]
 
-
-
 #############################################
 # MODULAR DRIVE LOGIC WITH USER PARAMETERS  #
 #############################################
 
 import math
 
-import math
-
 # ================= USER CONFIGURABLE PARAMETERS =================
-TARGET_SPEED = 300 
-STEER_GAIN = 15        # Ridotto leggermente per evitare oscillazioni
-CENTERING_GAIN = 0.3   
-BRAKE_THRESHOLD = 0.1  
-GEAR_SPEEDS = [0, 50, 90, 130, 170, 210] 
-ENABLE_TRACTION_CONTROL = True
+# Queste variabili globali sono il "Setup" della tua auto. 
+# Modificarle cambia il carattere della vettura senza toccare la matematica complessa.
+
+TARGET_SPEED = 300       # Velocità massima assoluta che l'auto cercherà di raggiungere nei lunghi rettilinei.
+STEER_GAIN = 30          # Sensibilità dello sterzo: quanto bruscamente gira le ruote in base all'angolo della pista.
+CENTERING_GAIN = 0.1     # "Forza di attrazione" verso il centro. A 0.1 è debole, permettendo all'auto di allargarsi sui cordoli.
+BRAKE_THRESHOLD = 0.1    # (Non utilizzato in questo blocco, ma di solito indica una soglia di attivazione del freno)
+GEAR_SPEEDS = [0, 55, 85, 130, 170, 200]  # Le velocità (in km/h) a cui la macchina passa alla marcia successiva (1a, 2a, 3a, ecc.)
+ENABLE_TRACTION_CONTROL = True # Interruttore per attivare/disattivare il sistema anti-pattinamento.
 
 # ================= HELPER FUNCTIONS =================
 
 def calculate_steering(S):
-    # Prova a stare al centro, ma dai molta importanza all'angolo della pista
-    steer = (S['angle'] * STEER_GAIN / math.pi) - (S['trackPos'] * CENTERING_GAIN)
-    return max(-1, min(1, steer))
+    # --- STERZO DINAMICO ---
+    # Come nelle auto vere, a bassa velocità serve girare di più il volante per fare la curva.
+    dynamic_gain = STEER_GAIN
+    if S['speedX'] < 80:
+        # Se andiamo a meno di 80 km/h, aumentiamo la sensibilità dello sterzo del 50%.
+        # Questo aiuta tantissimo nei tornanti stretti come il Cavatappi.
+        dynamic_gain = STEER_GAIN * 1.5
+
+    # Formula dello sterzo:
+    # 1. (S['angle'] * dynamic_gain) -> Segue l'angolo della pista.
+    # 2. - (S['trackPos'] * CENTERING_GAIN) -> Piccola correzione per non finire sull'erba.
+    steer = (S['angle'] * dynamic_gain / math.pi) - (S['trackPos'] * CENTERING_GAIN)
+    
+    # Assicuriamoci che il valore inviato al server sia tra -1.0 (tutto a destra) e 1.0 (tutto a sinistra).
+    return max(-1.0, min(1.0, steer))
 
 def calculate_speed_logic(S):
-    """
-    Gestisce congiuntamente accelerazione e frenata guardando avanti.
-    """
     speed = S['speedX']
-    # Il sensore 9 è quello che guarda dritto davanti alla macchina
-    # I sensori da 0 a 18 coprono un arco di 180 gradi davanti all'auto
-    dist_ahead = S['track'][9] 
     
-    # Calcoliamo una velocità di sicurezza basata sulla distanza rilevata davanti
-    # Se la strada è libera (dist > 150m), punta a TARGET_SPEED.
-    # Se c'è una curva (dist bassa), riduci drasticamente la velocità target.
-    safe_speed = TARGET_SPEED
-    if dist_ahead < 100:
-        # Esempio: se vedo solo 50 metri, la mia velocità target scende drasticamente
-        safe_speed = dist_ahead * 2.0 + 20 
+    # --- PERCEZIONE VISIVA ---
+    # Invece di guardare solo un punto davanti (sensore 9), guardiamo un "ventaglio" di 5 sensori centrali.
+    # Questo evita che l'auto freni per sbaglio se sbanda un attimo e il muso punta il muro.
+    front_vision = S['track'][7:12]
+    max_dist_ahead = max(front_vision) # Prende la distanza libera più lunga disponibile davanti.
 
+    # --- CALCOLO VELOCITÀ IDEALE (SAFE SPEED) ---
+    # Regola base: Velocità Sicura = Distanza visibile moltiplicata per 2.
+    # Esempio: Vedo a 150 metri -> Posso andare a 300 km/h. Vedo a 50 metri (curva vicina) -> Devo scendere a 100 km/h.
+    safe_speed = max_dist_ahead * 2.5
+    
+    # Limitiamo la safe_speed per evitare comportamenti estremi:
+    # - Non scende mai sotto i 65 km/h (altrimenti si pianta in curva perdendo slancio).
+    # - Non supera mai la TARGET_SPEED massima (300 km/h).
+    safe_speed = max(75.0, min(TARGET_SPEED, safe_speed))
+
+    # --- CONTROLLO DEI PEDALI (PROPORZIONALE) ---
     accel = 0.0
     brake = 0.0
+    diff = safe_speed - speed # Calcola lo scarto tra quanto dovremmo andare e quanto stiamo andando.
 
-    if speed < safe_speed:
-        # Accelera se siamo sotto la velocità di sicurezza
-        accel = 1.0 if speed < 100 else 0.6
-        brake = 0.0
+    if diff > 0:
+        # SIAMO LENTI (diff è positivo) -> Dobbiamo accelerare
+        # Minore è la differenza, meno gas diamo (per evitare scatti), dividendo per 20.
+        accel = min(1.0, diff / 20.0) 
+        
+        # Spinta esplosiva: se andiamo a meno di 90 km/h, diamo il 100% di gas a prescindere.
+        # Serve a schizzare fuori dalle curve lente senza esitazioni.
+        if speed < 90: 
+            accel = 1.0
     else:
-        # Frena se siamo sopra la velocità di sicurezza
-        accel = 0.0
-        # Più siamo veloci rispetto al limite di sicurezza, più freniamo forte
-        brake = min(1.0, (speed - safe_speed) / 50.0)
+        # SIAMO TROPPO VELOCI (diff è negativo) -> Dobbiamo frenare
+        # Tolleranza: Ignoriamo piccole variazioni (fino a 10 km/h sopra il limite) per far scorrere la macchina
+        # senza che tocchi continuamente i freni nei falsi allarmi.
+        if abs(diff) > 10:
+            brake = min(1.0, (-diff) / 35.0) # (-diff) trasforma il numero in positivo per il pedale del freno.
 
-    # Frenata di emergenza basata sull'angolo (se stiamo già sterzando molto)
-    if abs(S['angle']) > 0.2 and speed > 80:
-        brake = max(brake, 0.4)
+    # --- PANIC BRAKE (SISTEMA DI EMERGENZA) ---
+    # Se il sensore esattamente dritto (il 9) vede un muro a meno di 45 metri e stiamo andando forte (>80km/h),
+    # ignora tutti i calcoli dolci e INCHIODA (freno al 100%).
+    if S['track'][9] < 45 and speed > 80:
+        brake = 1.0
 
     return accel, brake
 
 def shift_gears(S):
+    # --- CAMBIO MARCE ---
     gear = 1
-    # Scalata: se la velocità scende, scala marcia
     speed = S['speedX']
+    # Controlla la nostra velocità contro la lista GEAR_SPEEDS definita in alto.
+    # Scala le marce dinamicamente se la velocità scende (aiuta anche il freno motore).
     for i, threshold in enumerate(GEAR_SPEEDS):
         if speed > threshold:
             gear = i + 1
     return gear
 
 def traction_control(S, accel):
+    # --- CONTROLLO TRAZIONE (TCS) ---
     if ENABLE_TRACTION_CONTROL:
-        # Se le ruote posteriori girano molto più veloce delle anteriori
+        # Calcola quanto slittano le ruote (Rotazione ruote posteriori meno rotazione ruote anteriori).
         slip = (S['wheelSpinVel'][2] + S['wheelSpinVel'][3]) - (S['wheelSpinVel'][0] + S['wheelSpinVel'][1])
+        
+        # Se le ruote dietro girano molto più a vuoto di quelle davanti (>5)...
         if slip > 5:
+            # ...taglia la potenza del motore (-0.3) per far riprendere aderenza alle gomme.
             accel -= 0.3
+            
+    # Assicura che l'acceleratore non diventi mai un numero negativo.
     return max(0.0, accel)
 
 # ================= MAIN DRIVE FUNCTION =================
 def drive_modular(c):
+    # Estrae i Sensori (S) e i Comandi da inviare (R)
     S, R = c.S.d, c.R.d
     
-    # 1. Calcolo Sterzo
+    # 1. Chiede alla funzione helper quanto girare il volante.
     R['steer'] = calculate_steering(S)
     
-    # 2. Calcolo Velocità (Accel e Brake insieme per evitare conflitti)
+    # 2. Chiede alla funzione helper quanto gas o freno dare.
     accel, brake = calculate_speed_logic(S)
     
-    # 3. Applicazione controlli
+    # --- 3. TRAIL BRAKING FISICO ---
+    # Concetto avanzato di corsa: se sterzo molto, devo frenare di meno, altrimenti le gomme anteriori 
+    # si bloccano (sottosterzo) e la macchina va dritta.
+    # Qui sottraiamo fino al 50% della pressione del freno in base a quanto è girato il volante.
+    brake = brake * (1.0 - (abs(R['steer']) * 0.5))
+
+    # 4. Applica l'acceleratore, passandolo prima attraverso il filtro anti-pattinamento (TCS).
     R['accel'] = traction_control(S, accel)
-    R['brake'] = brake
     
-    # 4. Cambio marcia
+    # 5. Applica il freno definitivo (assicurandosi sia tra 0 e 100%).
+    R['brake'] = max(0.0, min(1.0, brake))
+    
+    # 6. Cambia la marcia.
     R['gear'] = shift_gears(S)
     
-    # Assicuriamoci che se freniamo, non acceleriamo (molti server TORCS lo richiedono)
-    if R['brake'] > 0:
-        R['accel'] = 0
+    # --- 7. SICUREZZA FINALE ---
+    # In fisica non si frena e accelera contemporaneamente (nella guida normale).
+    # Se stiamo toccando il freno, azzera l'acceleratore.
+    if R['brake'] > 0.05:
+        R['accel'] = 0.0
         
     return
 
 # ================= MAIN LOOP =================
+# Questo è il motore del programma. Continua a girare all'infinito (fino al massimo degli step).
 if __name__ == "__main__":
-    C = Client(p=3001)
+    C = Client(p=3001) # Si connette al server di TORCS sulla porta 3001
     for step in range(C.maxSteps, 0, -1):
-        C.get_servers_input()
-        drive_modular(C)
-        C.respond_to_server()
+        C.get_servers_input()  # Legge i sensori dal gioco
+        drive_modular(C)       # Passa i dati al "cervello" della nostra IA
+        C.respond_to_server()  # Invia i comandi (sterzo, gas, freno) al gioco
     C.shutdown()
