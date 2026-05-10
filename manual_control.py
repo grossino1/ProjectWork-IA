@@ -1,170 +1,136 @@
-from pynput.keyboard import Key, Listener
-import snakeoil3_jm2 as snakeoil3
-import time
+import csv
 import json
+import time
+import pygame # <--- Nuova libreria per il controller
+import snakeoil3_jm2 as snakeoil3
 
-
-class ArcadeController:
+class GamepadController:
     def __init__(self):
-        self.keys = set()
-
-        self.state = {
-            'steer': 0.0,
-            'accel': 0.0,
-            'brake': 0.0,
-            'gear': 1
-        }
-
-        self.listener = Listener(on_press=self.press, on_release=self.release)
-        self.listener.start()
-
-    def press(self, key):
-        self.keys.add(key)
-
-        if hasattr(key, "char"):
-            if key.char == 'w':
-                self.state['gear'] += 1
-            elif key.char == 's':
-                self.state['gear'] -= 1
-
-    def release(self, key):
-        self.keys.discard(key)
+        pygame.init()
+        pygame.joystick.init()
+        
+        self.state = {'steer': 0.0, 'accel': 0.0, 'brake': 0.0, 'gear': 1}
+        self.last_gear_up = False
+        self.last_gear_down = False
+        
+        # Controlliamo se c'est un joystick connesso
+        if pygame.joystick.get_count() == 0:
+            print("ERRORE: Nessun controller rilevato!")
+            print("Assicurati di averlo collegato alla Macchina Virtuale Parallels.")
+            self.joy = None
+        else:
+            self.joy = pygame.joystick.Joystick(0)
+            self.joy.init()
+            print(f"Controller connesso con successo: {self.joy.get_name()}")
+            print(f"Assi rilevati: {self.joy.get_numaxes()}, Pulsanti: {self.joy.get_numbuttons()}")
 
     def update(self, sensors):
-        speed = sensors.get('speedX', 0)
-        angle = sensors.get('angle', 0)
+        if not self.joy:
+            return # Se non c'è controller, non fare nulla
+
+        # Aggiorna gli eventi di pygame (necessario per leggere i dati freschi)
+        pygame.event.pump()
 
         # ========================
-        # ACCELERAZIONE SMOOTH
+        # 1. STERZO (Levetta Sinistra - Asse 0)
         # ========================
-        target_accel = 1.0 if Key.up in self.keys else 0.0
-        self.state['accel'] += (target_accel - self.state['accel']) * 0.1
+        # I valori vanno da -1.0 (sinistra) a 1.0 (destra)
+        steer_axis = -self.joy.get_axis(0)
+        
+        # Deadzone: i controller vecchi hanno un po' di "gioco" al centro. 
+        # Ignoriamo i micro-movimenti per andare dritti perfetti.
+        if abs(steer_axis) < 0.05:
+            steer_axis = 0.0
+            
+        self.state['steer'] = steer_axis
 
         # ========================
-        # FRENO
+        # 2. PEDALI (Grilletti - Assi 4 e 5)
         # ========================
-        target_brake = 1.0 if Key.down in self.keys else 0.0
-        self.state['brake'] += (target_brake - self.state['brake']) * 0.2
+        # IMPORTANTE: Su Windows/Xbox i grilletti partono da -1.0 (rilasciati) 
+        # e arrivano a 1.0 (premuti). Dobbiamo convertirli in un range da 0.0 a 1.0.
+        
+        # Acceleratore (Grilletto destro, di solito Asse 5)
+        raw_accel = self.joy.get_axis(5) 
+        self.state['accel'] = max(0.0, (raw_accel + 1.0) / 2.0)
+        
+        # Freno (Grilletto sinistro, di solito Asse 4)
+        raw_brake = self.joy.get_axis(4)
+        self.state['brake'] = max(0.0, (raw_brake + 1.0) / 2.0)
 
         # ========================
-        # STEERING INPUT
+        # 3. CAMBIO MARCE (Pulsanti 0 e 1)
         # ========================
-        # INPUT
-        steer_input = 0.0
-        if Key.left in self.keys:
-            steer_input += 0.6
-        if Key.right in self.keys:
-            steer_input -= 0.6
+        # Pulsante 0 (A su Xbox, Croce su PS) -> Marcia Su
+        current_gear_up = self.joy.get_button(0)
+        if current_gear_up and not self.last_gear_up:
+            self.state['gear'] = min(6, self.state['gear'] + 1)
+        self.last_gear_up = current_gear_up
 
-        # LIMITE VELOCITÀ
-        max_steer = max(0.25, 1.0 - speed / 200.0)
-        steer_input *= max_steer
+        # Pulsante 1 (B su Xbox, Cerchio su PS) -> Marcia Giù
+        current_gear_down = self.joy.get_button(1)
+        if current_gear_down and not self.last_gear_down:
+            self.state['gear'] = max(-1, self.state['gear'] - 1)
+        self.last_gear_down = current_gear_down
 
-        # SE NON STAI STERZANDO → VAI DRITTO
-        if abs(steer_input) < 0.01:
-            steer_target = 0.0
-        else:
-            stability = angle * 0.3
-            steer_target = steer_input - stability
-
-        # SMOOTH
-        self.state['steer'] += (steer_target - self.state['steer']) * 0.2
-
-        # DEAD ZONE
-        if abs(self.state['steer']) < 0.02:
-            self.state['steer'] = 0.0
-
-        # clamp
+        # Sicurezza
         self.state['steer'] = max(-1.0, min(1.0, self.state['steer']))
         self.state['accel'] = max(0.0, min(1.0, self.state['accel']))
         self.state['brake'] = max(0.0, min(1.0, self.state['brake']))
 
-        # marce
-        self.state['gear'] = max(-1, min(6, self.state['gear']))
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
 def main():
     client = snakeoil3.Client(p=3001, vision=False)
-    controller = ArcadeController()
-
+    controller = GamepadController()
     client.get_servers_input()
-
-    print("Arcade driving mode attivo")
-    print("Freccie per guidare, W/S per marce")
-
-
-    # CSV log
-    log_csv = open("manual_log.csv", "w")
-    log_csv.write("time,steer,accel,brake,gear,speedX,trackPos,angle,rpm,damage\n")
-
-    # JSON log (step-by-step strutturato)
-    log_json = []
     
-    t0 = time.time()
-    step = 0
+    print("LOGGING CONTROLLER ATTIVO - Tutto il traffico dati verrà salvato.")
 
-    while True:
-        S = client.S.d
+    S_init = client.S.d
+    headers = ["timestamp", "target_steer", "target_accel", "target_brake", "target_gear"]
+    
+    for key, value in sorted(S_init.items()):
+        if isinstance(value, list):
+            for i in range(len(value)):
+                headers.append(f"{key}_{i}")
+        else:
+            headers.append(key)
 
-        controller.update(S)
-        a = controller.state
+    with open("dataset_gamepad.csv", "w", newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+
+        t0 = time.time()
+        step = 0
         
-        print(f"steer={a['steer']:.2f} accel={a['accel']:.2f} brake={a['brake']:.2f} gear={a['gear']}")
-
-        client.R.d['steer'] = a['steer']
-        client.R.d['accel'] = a['accel']
-        client.R.d['brake'] = a['brake']
-        client.R.d['gear'] = a['gear']
-        client.R.d['clutch'] = 0.0
-        client.R.d['meta'] = 0
-
-        client.respond_to_server()
-        client.get_servers_input()
-
-        #S = client.S.d
-
-        current_time = time.time() - t0
-
-        # ===== CSV LOG =====
-        log_csv.write(
-            f"{current_time},{a['steer']},{a['accel']},{a['brake']},{a['gear']},"
-            f"{S.get('speedX',0)},{S.get('trackPos',0)},{S.get('angle',0)},"
-            f"{S.get('rpm',0)},{S.get('damage',0)}\n"
-        )
-
-        # ===== JSON LOG (STEP-BY-STEP) =====
-        log_json.append({
-            "step": step,
-            "time": current_time,
-            "action": {
-                "steer": a['steer'],
-                "accel": a['accel'],
-                "brake": a['brake'],
-                "gear": a['gear']
-            },
-            "state": {
-                "speedX": S.get('speedX', 0),
-                "trackPos": S.get('trackPos', 0),
-                "angle": S.get('angle', 0),
-                "rpm": S.get('rpm', 0),
-                "damage": S.get('damage', 0)
-            }
-        })
-
-        step += 1
-
-        # salva JSON ogni tot step (evita perdita dati)
-        if step % 100 == 0:
-            with open("manual_log.json", "w") as f:
-                json.dump(log_json, f, indent=2)
+        try:
+            while True:
+                S = client.S.d
+                controller.update(S)
+                a = controller.state
                 
+                client.R.d.update(a)
+                client.respond_to_server()
+                client.get_servers_input()
                 
-        time.sleep(0.02)
-
+                current_time = time.time() - t0
+                row = [current_time, a['steer'], a['accel'], a['brake'], a['gear']]
+                
+                for key in sorted(S.keys()):
+                    val = S[key]
+                    if isinstance(val, list):
+                        row.extend(val)
+                    else:
+                        row.append(val)
+                
+                writer.writerow(row)
+                step += 1
+                
+                if step % 100 == 0:
+                    print(f"Step: {step} | Vel: {S.get('speedX',0):.0f} | Steer: {a['steer']:.2f} | Accel: {a['accel']:.2f} | Brake: {a['brake']:.2f}")
+                    
+        except KeyboardInterrupt:
+            print("\nSalvataggio completato. Dataset pronto.")
+            pygame.quit()
 
 if __name__ == "__main__":
     main()

@@ -446,10 +446,10 @@ import math
 # Modificarle cambia il carattere della vettura senza toccare la matematica complessa.
 
 TARGET_SPEED = 300       # Velocità massima assoluta che l'auto cercherà di raggiungere nei lunghi rettilinei.
-STEER_GAIN = 30          # Sensibilità dello sterzo: quanto bruscamente gira le ruote in base all'angolo della pista.
+STEER_GAIN = 20          # Sensibilità dello sterzo: quanto bruscamente gira le ruote in base all'angolo della pista.
 CENTERING_GAIN = 0.1     # "Forza di attrazione" verso il centro. A 0.1 è debole, permettendo all'auto di allargarsi sui cordoli.
 BRAKE_THRESHOLD = 0.1    # (Non utilizzato in questo blocco, ma di solito indica una soglia di attivazione del freno)
-GEAR_SPEEDS = [0, 55, 85, 130, 170, 200]  # Le velocità (in km/h) a cui la macchina passa alla marcia successiva (1a, 2a, 3a, ecc.)
+GEAR_SPEEDS = [0, 60, 95, 150, 225, 270]  # Le velocità (in km/h) a cui la macchina passa alla marcia successiva (1a, 2a, 3a, ecc.)
 ENABLE_TRACTION_CONTROL = True # Interruttore per attivare/disattivare il sistema anti-pattinamento.
 
 # ================= HELPER FUNCTIONS =================
@@ -477,7 +477,7 @@ def calculate_speed_logic(S):
     # --- PERCEZIONE VISIVA ---
     # Invece di guardare solo un punto davanti (sensore 9), guardiamo un "ventaglio" di 5 sensori centrali.
     # Questo evita che l'auto freni per sbaglio se sbanda un attimo e il muso punta il muro.
-    front_vision = S['track'][7:12]
+    front_vision = S['track'][5:14]
     max_dist_ahead = max(front_vision) # Prende la distanza libera più lunga disponibile davanti.
 
     # --- CALCOLO VELOCITÀ IDEALE (SAFE SPEED) ---
