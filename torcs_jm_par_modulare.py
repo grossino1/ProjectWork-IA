@@ -440,6 +440,8 @@ def destringify(s):
 #############################################
 
 import math
+import csv  
+import time
 
 # ================= USER CONFIGURABLE PARAMETERS =================
 # Queste variabili globali sono il "Setup" della tua auto. 
@@ -449,7 +451,7 @@ TARGET_SPEED = 300       # Velocità massima assoluta che l'auto cercherà di ra
 STEER_GAIN = 20          # Sensibilità dello sterzo: quanto bruscamente gira le ruote in base all'angolo della pista.
 CENTERING_GAIN = 0.1     # "Forza di attrazione" verso il centro. A 0.1 è debole, permettendo all'auto di allargarsi sui cordoli.
 BRAKE_THRESHOLD = 0.1    # (Non utilizzato in questo blocco, ma di solito indica una soglia di attivazione del freno)
-GEAR_SPEEDS = [0, 60, 95, 150, 225, 270]  # Le velocità (in km/h) a cui la macchina passa alla marcia successiva (1a, 2a, 3a, ecc.)
+GEAR_SPEEDS = [0, 60, 95, 150, 230, 270]  # Le velocità (in km/h) a cui la macchina passa alla marcia successiva (1a, 2a, 3a, ecc.)
 ENABLE_TRACTION_CONTROL = True # Interruttore per attivare/disattivare il sistema anti-pattinamento.
 
 # ================= HELPER FUNCTIONS =================
@@ -580,10 +582,77 @@ def drive_modular(c):
 
 # ================= MAIN LOOP =================
 # Questo è il motore del programma. Continua a girare all'infinito (fino al massimo degli step).
+# ================= MAIN LOOP CON DATA LOGGER OTTIMIZZATO =================
 if __name__ == "__main__":
-    C = Client(p=3001) # Si connette al server di TORCS sulla porta 3001
-    for step in range(C.maxSteps, 0, -1):
-        C.get_servers_input()  # Legge i sensori dal gioco
-        drive_modular(C)       # Passa i dati al "cervello" della nostra IA
-        C.respond_to_server()  # Invia i comandi (sterzo, gas, freno) al gioco
-    C.shutdown()
+    C = Client(p=3001) 
+    
+    print("=========================================")
+    print("BOT 1:49 AVVIATO - DATASET OTTIMIZZATO")
+    print("=========================================")
+    
+    dataset_filename = "dataset_bot_154_clean.csv"
+    csv_file = open(dataset_filename, "w", newline='')
+    csv_writer = csv.writer(csv_file)
+    
+    # --- LA NOSTRA BLACKLIST ---
+    # Inseriamo qui tutto il "rumore" che non serve all'IA per imparare a guidare da sola
+    KEYS_TO_IGNORE = [
+        'opponents', 'focus', 'fuel', 'damage', 'z', 
+        'curLapTime', 'lastLapTime', 'distFromStart', 'distRaced', 'racePos'
+    ]
+    
+    headers_written = False
+    step_count = 0
+    t0 = time.time()
+    
+    try:
+        for step in range(C.maxSteps, 0, -1):
+            C.get_servers_input()  
+            drive_modular(C)       
+            
+            # --- SEZIONE DI LOGGING INTELLIGENTE ---
+            if not headers_written:
+                headers = ["timestamp", "target_steer", "target_accel", "target_brake", "target_gear"]
+                for key, value in sorted(C.S.d.items()):
+                    if key in KEYS_TO_IGNORE: # Se la chiave è nella blacklist, saltala!
+                        continue
+                        
+                    if isinstance(value, list):
+                        for i in range(len(value)):
+                            headers.append(f"{key}_{i}")
+                    else:
+                        headers.append(key)
+                csv_writer.writerow(headers)
+                headers_written = True
+
+            current_time = time.time() - t0
+            row = [current_time, C.R.d['steer'], C.R.d['accel'], C.R.d['brake'], C.R.d['gear']]
+            
+            for key in sorted(C.S.d.keys()):
+                if key in KEYS_TO_IGNORE: # Saltiamo i dati inutili anche qui
+                    continue
+                    
+                val = C.S.d[key]
+                if isinstance(val, list):
+                    row.extend(val)
+                else:
+                    row.append(val)
+                    
+            csv_writer.writerow(row)
+            step_count += 1
+            
+            if step_count % 100 == 0:
+                print(f"Registrati {step_count} step puliti... (Vel: {int(C.S.d['speedX'])} km/h)")
+
+            C.respond_to_server()  
+            
+    except KeyboardInterrupt:
+        print("\nRegistrazione interrotta manualmente.")
+        
+    finally:
+        csv_file.close()
+        C.shutdown()
+        print("=========================================")
+        print(f"Salvataggio completato! File: {dataset_filename}")
+        print(f"Righe totali: {step_count}")
+        print("=========================================")
