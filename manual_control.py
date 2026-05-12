@@ -1,8 +1,9 @@
 import csv
 import json
 import time
-import pygame # <--- Nuova libreria per il controller
+import pygame 
 import snakeoil3_jm2 as snakeoil3
+import os
 
 class GamepadController:
     def __init__(self):
@@ -83,53 +84,87 @@ def main():
     controller = GamepadController()
     client.get_servers_input()
     
-    print("LOGGING CONTROLLER ATTIVO - Tutto il traffico dati verrà salvato.")
+    print("=========================================")
+    print("LOGGING CONTROLLER ATTIVO (10 Hz)")
+    print("=========================================")
 
-    S_init = client.S.d
-    headers = ["timestamp", "target_steer", "target_accel", "target_brake", "target_gear"]
-    
-    for key, value in sorted(S_init.items()):
-        if isinstance(value, list):
-            for i in range(len(value)):
-                headers.append(f"{key}_{i}")
-        else:
-            headers.append(key)
+    dataset_filename = "dataset_gamepad_clean.csv"
+    file_exists = os.path.isfile(dataset_filename)
 
-    with open("dataset_gamepad.csv", "w", newline='') as f:
+    # --- LA BLACKLIST (Sensori da ignorare) ---
+    KEYS_TO_IGNORE = [
+        'opponents', 'focus', 'fuel', 'damage', 'z', 
+        'lastLapTime', 'racePos'
+    ]
+
+    # Apriamo in modalità APPEND ('a')
+    with open(dataset_filename, "a", newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(headers)
+
+        # Scriviamo gli header SOLO se il file è nuovo
+        if not file_exists:
+            S_init = client.S.d
+            headers = ["timestamp", "target_steer", "target_accel", "target_brake", "target_gear"]
+            for key, value in sorted(S_init.items()):
+                if key in KEYS_TO_IGNORE: 
+                    continue
+                if isinstance(value, list):
+                    for i in range(len(value)): 
+                        headers.append(f"{key}_{i}")
+                else: 
+                    headers.append(key)
+            writer.writerow(headers)
 
         t0 = time.time()
         step = 0
+        last_dist_raced = 0.0
         
+        # --- FRAME SKIPPING ---
+        LOG_INTERVAL = 5 # Registra 1 frame ogni 5 (Riduce il file dell'80%)
+
         try:
             while True:
                 S = client.S.d
                 controller.update(S)
                 a = controller.state
                 
+                # --- RILEVATORE PARTENZA/RESET IN TEMPO REALE ---
+                current_dist = S.get('distRaced', 0.0)
+                if current_dist < last_dist_raced - 10:
+                    print("\n[!] ---> PARTENZA DA FERMO / NUOVO GIRO RILEVATO <---")
+                last_dist_raced = current_dist
+                
                 client.R.d.update(a)
                 client.respond_to_server()
                 client.get_servers_input()
                 
                 current_time = time.time() - t0
+                
+                # Costruzione della riga dati
                 row = [current_time, a['steer'], a['accel'], a['brake'], a['gear']]
                 
+                # Filtro dei sensori importanti
                 for key in sorted(S.keys()):
+                    if key in KEYS_TO_IGNORE: 
+                        continue
                     val = S[key]
                     if isinstance(val, list):
                         row.extend(val)
                     else:
                         row.append(val)
                 
-                writer.writerow(row)
                 step += 1
                 
+                # --- SCRITTURA OTTIMIZZATA NEL CSV ---
+                if step % LOG_INTERVAL == 0:
+                    writer.writerow(row)
+                
+                # Stampa a schermo (ogni 100 step fisici)
                 if step % 100 == 0:
-                    print(f"Step: {step} | Vel: {S.get('speedX',0):.0f} | Steer: {a['steer']:.2f} | Accel: {a['accel']:.2f} | Brake: {a['brake']:.2f}")
+                    print(f"Step: {step} | Vel: {S.get('speedX',0):.0f} km/h | Distanza: {int(current_dist)}m | Steer: {a['steer']:.2f}")
                     
         except KeyboardInterrupt:
-            print("\nSalvataggio completato. Dataset pronto.")
+            print(f"\nSalvataggio completato. Dataset accodato in: {dataset_filename}")
             pygame.quit()
 
 if __name__ == "__main__":

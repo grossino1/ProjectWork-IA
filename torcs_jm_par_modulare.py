@@ -442,6 +442,7 @@ def destringify(s):
 import math
 import csv  
 import time
+import os
 
 # ================= USER CONFIGURABLE PARAMETERS =================
 # Queste variabili globali sono il "Setup" della tua auto. 
@@ -580,48 +581,62 @@ def drive_modular(c):
         
     return
 
-# ================= MAIN LOOP =================
-# Questo è il motore del programma. Continua a girare all'infinito (fino al massimo degli step).
-# ================= MAIN LOOP CON DATA LOGGER OTTIMIZZATO =================
+# ================= MAIN LOOP CON APPEND E FLAG DI RESET =================
+# ================= MAIN LOOP CON APPEND, FLAG DI RESET E FRAME SKIPPING =================
 if __name__ == "__main__":
+    # from snakeoil3_jm2 import Client # (Decommenta se serve importare Client qui)
+    
     C = Client(p=3001) 
-    
-    print("=========================================")
-    print("BOT 1:49 AVVIATO - DATASET OTTIMIZZATO")
-    print("=========================================")
-    
     dataset_filename = "dataset_bot_154_clean.csv"
-    csv_file = open(dataset_filename, "w", newline='')
-    csv_writer = csv.writer(csv_file)
     
-    # --- LA NOSTRA BLACKLIST ---
-    # Inseriamo qui tutto il "rumore" che non serve all'IA per imparare a guidare da sola
+    # 1. Controlliamo se il file esiste già prima di aprirlo
+    file_exists = os.path.isfile(dataset_filename)
+    
+    # 2. Apriamo in modalità 'a' (Append). Se non esiste, lo crea.
+    csv_file = open(dataset_filename, "a", newline='')
+    csv_writer = csv.writer(csv_file)
+
+    # --- LA NOSTRA BLACKLIST CORRETTA ---
+    # NOTA: Ho tolto 'distRaced', 'distFromStart' e 'curLapTime' da qui. 
+    # DEVONO essere salvati nel CSV per permettere all'IA di capire quando inizia un giro.
     KEYS_TO_IGNORE = [
         'opponents', 'focus', 'fuel', 'damage', 'z', 
-        'curLapTime', 'lastLapTime', 'distFromStart', 'distRaced', 'racePos'
+        'lastLapTime', 'racePos'
     ]
     
-    headers_written = False
+    # Se il file esisteva già, non dobbiamo riscrivere gli header
+    headers_written = True if file_exists else False
+    
+    print(f"--- LOGGING BOT ATTIVO: {'Accodamento dati (Append)' if file_exists else 'Nuovo file creato'} ---")
+    print("Tracciamento telemetrico 'distRaced' per partenze da fermo: ATTIVATO")
+    print("Frame Skipping: ATTIVATO (Salvataggio a 10 Hz)")
+    
     step_count = 0
     t0 = time.time()
+    last_dist_raced = 0.0  
+    
+    # --- IMPOSTAZIONE FRAME SKIPPING ---
+    LOG_INTERVAL = 5 # Registra 1 frame ogni 5 (Riduce il file dell'80%)
     
     try:
         for step in range(C.maxSteps, 0, -1):
             C.get_servers_input()  
             drive_modular(C)       
             
-            # --- SEZIONE DI LOGGING INTELLIGENTE ---
+            # --- RICONOSCIMENTO PARTENZE / RESET IN TEMPO REALE ---
+            current_dist = C.S.d.get('distRaced', 0.0)
+            if current_dist < last_dist_raced - 10: 
+                print("\n[!] ---> PARTENZA DA FERMO RILEVATA (Dati separati con successo) <---")
+            last_dist_raced = current_dist
+
+            # --- LOGICA SALVATAGGIO ---
             if not headers_written:
                 headers = ["timestamp", "target_steer", "target_accel", "target_brake", "target_gear"]
                 for key, value in sorted(C.S.d.items()):
-                    if key in KEYS_TO_IGNORE: # Se la chiave è nella blacklist, saltala!
-                        continue
-                        
+                    if key in KEYS_TO_IGNORE: continue
                     if isinstance(value, list):
-                        for i in range(len(value)):
-                            headers.append(f"{key}_{i}")
-                    else:
-                        headers.append(key)
+                        for i in range(len(value)): headers.append(f"{key}_{i}")
+                    else: headers.append(key)
                 csv_writer.writerow(headers)
                 headers_written = True
 
@@ -629,30 +644,25 @@ if __name__ == "__main__":
             row = [current_time, C.R.d['steer'], C.R.d['accel'], C.R.d['brake'], C.R.d['gear']]
             
             for key in sorted(C.S.d.keys()):
-                if key in KEYS_TO_IGNORE: # Saltiamo i dati inutili anche qui
-                    continue
-                    
+                if key in KEYS_TO_IGNORE: continue
                 val = C.S.d[key]
-                if isinstance(val, list):
-                    row.extend(val)
-                else:
-                    row.append(val)
-                    
-            csv_writer.writerow(row)
+                if isinstance(val, list): row.extend(val)
+                else: row.append(val)
+            
             step_count += 1
             
+            # --- SCRITTURA OTTIMIZZATA NEL CSV (FRAME SKIPPING) ---
+            if step_count % LOG_INTERVAL == 0:
+                csv_writer.writerow(row)
+            
             if step_count % 100 == 0:
-                print(f"Registrati {step_count} step puliti... (Vel: {int(C.S.d['speedX'])} km/h)")
+                print(f"Step sessione: {step_count} | Vel: {int(C.S.d['speedX'])} km/h | Distanza: {int(current_dist)}m")
 
             C.respond_to_server()  
             
     except KeyboardInterrupt:
-        print("\nRegistrazione interrotta manualmente.")
-        
+        print("\nSessione terminata dall'utente. Nessun dato perso.")
     finally:
         csv_file.close()
         C.shutdown()
-        print("=========================================")
-        print(f"Salvataggio completato! File: {dataset_filename}")
-        print(f"Righe totali: {step_count}")
-        print("=========================================")
+        print(f"Dati salvati e accodati in: {dataset_filename}")
