@@ -8,40 +8,49 @@ import random
 import csv
 import os
 import sys
+import time
 from collections import deque
 from gym_torcs import TorcsEnv
 from train_imitation import ExpertModel, INPUT_SIZE, OUTPUT_SIZE
 
-# --- HYPERPARAMETERS - FIDELITY FOCUS (v20) ---
+# --- HYPERPARAMETERS - SAFE RECOVERY (v33 - Sync Mode) ---
 INPUT_SIZE = 30 
 OUTPUT_SIZE = 4 
 GAMMA = 0.99
 TAU = 0.005 
-LR_ACTOR = 5e-7   # Ridotto ancora per preservare la traiettoria da 1:13
-LR_CRITIC = 5e-6  
+LR_ACTOR = 1e-6    # Learning rate molto basso per non rovinare la stabilità subito
+LR_CRITIC = 1e-4   
 BATCH_SIZE = 128 
 BUFFER_SIZE = 100000 
-TRAIN_EVERY = 1   
-GRADIENT_CLIP = 0.5 
-IMITATION_WEIGHT_START = 1.0 # 100% Imitazione per i primi episodi
-IMITATION_WEIGHT_END = 0.95  
-IMITATION_DECAY_EPISODES = 200 
-ACTOR_WARMUP_EPISODES = 10    # Nessun training RL per i primi 10 ep, solo raccolta dati
+IMITATION_WEIGHT_CORK = 0.95 
+ACTOR_WARMUP_EPISODES = 2 
 
 class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
+    def push(self, state, action, reward, next_state, done, track_idx):
+        self.buffer.append((state, action, reward, next_state, done, track_idx))
     def sample(self, batch_size):
-        state, action, reward, next_state, done = zip(*random.sample(self.buffer, batch_size))
-        return np.stack(state), np.stack(action), np.stack(reward), np.stack(next_state), np.stack(done)
+        cork_samples = [s for s in self.buffer if 2400 < s[5] < 2700]
+        other_samples = [s for s in self.buffer if not (2400 < s[5] < 2700)]
+        batch = []
+        if len(cork_samples) > batch_size * 0.6:
+            batch.extend(random.sample(cork_samples, int(batch_size * 0.6)))
+            batch.extend(random.sample(other_samples, batch_size - int(batch_size * 0.6)))
+        elif len(cork_samples) > 0:
+            batch.extend(cork_samples)
+            batch.extend(random.sample(other_samples, batch_size - len(cork_samples)))
+        else:
+            batch = random.sample(self.buffer, batch_size)
+        state, action, reward, next_state, done, track_idx = zip(*batch)
+        return np.stack(state), np.stack(action), np.stack(reward), np.stack(next_state), np.stack(done), np.stack(track_idx)
     def __len__(self):
         return len(self.buffer)
 
 class Actor(nn.Module):
     def __init__(self, input_size=INPUT_SIZE):
         super(Actor, self).__init__()
+        # Architettura originale 128 compatibile con GOLDEN_STABLE
         self.base = nn.Sequential(
             nn.Linear(input_size, 128),
             nn.LayerNorm(128),
@@ -89,17 +98,18 @@ def reinforce():
     env = TorcsEnv(vision=False, throttle=True, gear_change=True)
     actor = Actor(INPUT_SIZE)
     
-    if os.path.exists("optimized_actor.pth"):
-        actor.load_state_dict(torch.load("optimized_actor.pth"))
-        print(">>> Ripristinato modello OTTIMIZZATO")
+    # FORZIAMO L'USO DEL GOLDEN STABLE (L'unico di cui siamo certi al 100%)
+    model_path = "actor_GOLDEN_STABLE.pth"
+    if os.path.exists(model_path):
+        actor.load_state_dict(torch.load(model_path))
+        print(f">>> RECOVERY: Caricato {model_path} per garantire stabilità.")
     else:
-        try:
-            actor.load_state_dict(torch.load("expert_model.pth"))
-            print(">>> Pesi iniziali caricati da expert_model.pth (Traiettoria 1:13)")
-        except:
-            print("ERRORE: expert_model.pth mancante.")
-            return
+        print("ERRORE: actor_GOLDEN_STABLE.pth non trovato!")
+        return
 
+    expert_anchor = Actor(INPUT_SIZE)
+    expert_anchor.load_state_dict(torch.load(model_path))
+    
     target_actor = Actor(INPUT_SIZE)
     target_actor.load_state_dict(actor.state_dict())
     critic = Critic(INPUT_SIZE)
@@ -108,155 +118,94 @@ def reinforce():
     actor_optimizer = optim.Adam(actor.parameters(), lr=LR_ACTOR)
     critic_optimizer = optim.Adam(critic.parameters(), lr=LR_CRITIC)
     
-    # --- ANCHORING FIX ---
-    # Usiamo SEMPRE expert_model.pth come ancora di verità assoluta
-    # Invece di usare il modello ottimizzato corrente che potrebbe aver "imparato" vizi
-    expert_anchor = Actor(INPUT_SIZE)
-    try:
-        expert_anchor.load_state_dict(torch.load("expert_model.pth"))
-        print(">>> Expert Anchor fissato su expert_model.pth (Truth Reference)")
-    except:
-        expert_anchor.load_state_dict(actor.state_dict())
-        print(">>> ATTENZIONE: expert_model.pth non trovato, uso il modello corrente come ancora")
     expert_anchor.eval() 
-    
+    actor.train() 
     memory = ReplayBuffer(BUFFER_SIZE)
     
-    log_exists = os.path.exists("rl_optimization_results.csv")
     log_file = open("rl_optimization_results.csv", "a", newline='')
     log_writer = csv.writer(log_file)
     
-    best_dist = 2483.9 # FORZATO per proteggere il record
-    if not log_exists or os.path.getsize("rl_optimization_results.csv") == 0:
-        log_writer.writerow(["episode", "steps", "total_reward", "last_lap", "max_dist"])
-    else:
-        # Leggi la migliore distanza storica per evitare di sovrascrivere actor_best con robaccia
-        try:
-            with open("rl_optimization_results.csv", "r") as f:
-                reader = csv.DictReader(f)
-                dists = [float(row['max_dist']) for row in reader if row['max_dist']]
-                if dists: best_dist = max(max(dists), best_dist)
-                print(f">>> Record storico caricato: {best_dist:.1f}m")
-        except:
-            pass
-
     for episode in range(1000):
-        # --- ROBUST AUTONOMOUS RESET ---
-        # Rilancio TORCS ogni 20 episodi per pulire la memoria e prevenire freeze
-        relaunch = (episode % 20 == 0)
-        try:
-            env.reset(relaunch=relaunch)
-        except Exception as e:
-            print(f"!!! Errore critico durante il reset (Ep {episode}): {e}. Tento Hard Relaunch...")
-            env.reset(relaunch=True)
+        relaunch = False 
+        connected = False
+        while not connected:
+            try:
+                env.reset(relaunch=relaunch)
+                connected = True
+            except:
+                relaunch = True
+                time.sleep(5.0)
 
         obs = env.client.S.d 
         state = preprocess_state(obs)
         episode_reward = 0
         done = False
         steps = 0
-        prev_damage = obs.get('damage', 0)
-        max_dist_reached = 0.0
         start_dist_raced = obs.get('distRaced', 0)
-        prev_lap_time = 0.0
 
-        print(f"\n>>> INIZIO EPISODIO {episode} (Relaunch={relaunch})")
+        print(f"\n>>> RECOVERY EPISODIO {episode}")
+        actor.eval()
 
         while not done:
             state_t = torch.FloatTensor(state).unsqueeze(0)
-            with torch.no_grad(): action_t = actor(state_t)
+            track_index = obs.get('distFromStart', 0)
+            
+            # ZONA ACTOR BLINDATA: 2400-2700 (Solo Corkscrew)
+            is_actor_zone = (2400 < track_index < 2700)
+
+            with torch.no_grad():
+                if is_actor_zone:
+                    action_t = actor(state_t)
+                else:
+                    action_t = expert_anchor(state_t)
+            
             raw_action = action_t.numpy()[0]
             
-            # --- CHIRURGIA DEL NOISE (Solo Corkscrew) ---
-            dist_raced_absolute = obs.get('distRaced', 0)
-            track_index = dist_raced_absolute % 3602
-            
-            if episode < 2:
-                noise_scale = 0.0 # Stabilizzazione assoluta
-            elif 2350 < track_index < 2550:
-                noise_scale = 0.05 # Alta esplorazione nel punto critico
-            else:
-                noise_scale = 0.005 # Stabilità nel resto del circuito
+            if is_actor_zone and episode >= ACTOR_WARMUP_EPISODES:
+                noise = np.random.normal(0, 0.03, size=4)
+                raw_action = np.clip(raw_action + noise, -1.0, 1.0)
             
             env_action = raw_action.copy()
-            env_action[0] = np.clip(env_action[0] + np.random.normal(0, noise_scale), -1.0, 1.0)
-            
-            # Gear scaling 1-6
             env_action[3] = int(round(env_action[3] * 5.0 + 1.0))
-            
-            # Step
+
             try:
-                _, _, _, _ = env.step(env_action)
-            except Exception as e:
-                print(f"!!! Timeout/Errore durante lo step: {e}")
+                _, _, env_done, _ = env.step(env_action)
+                if env_done: done = True
+            except:
                 done = True
                 break
 
             obs = env.client.S.d
-            speed = obs['speedX']
-            angle = obs['angle']
-            track_pos = obs['trackPos']
-            curr_lap_time = obs.get('curLapTime', 0.0)
+            if not obs: break
+
+            speed = obs.get('speedX', 0.0)
+            angle = obs.get('angle', 0.0)
+            track_pos = obs.get('trackPos', 0.0)
             current_dist_raced = obs.get('distRaced', 0) - start_dist_raced
-            
-            # --- REWARD FUNCTION (Aligned with GEMINI.md) ---
-            # 1. Progresso Longitudinale: Vx * cos(theta)
-            progress = speed * np.cos(angle)
-            
-            # 2. Penalità Drift: Vx * sin(theta)
-            drift_penalty = abs(speed * np.sin(angle))
-            
-            # 4. Penalità Fuori Asse: Vx * trackPos
-            off_center_penalty = 0.0
-            if abs(track_pos) > 0.95:
-                off_center_penalty = speed * (abs(track_pos) - 0.95) * 5.0
 
-            # --- CHIRURGIA DEL REWARD (Corkscrew 2400m - 2550m) ---
-            vertical_penalty = 0.0
-            speed_limit_penalty = 0.0
-            
-            if 2400 < track_index < 2550:
-                # Penalità per caduta libera (speedZ negativa)
-                if obs['speedZ'] < -0.5:
-                    vertical_penalty = abs(obs['speedZ']) * 50.0
-                
-                # Forza la frenata: se arrivi sopra gli 80 km/h al drop, punizione
-                if track_index < 2460 and speed > 80:
-                    speed_limit_penalty = (speed - 80) * 10.0
+            # Reward Pulita (Progresso puro nel Corkscrew)
+            custom_reward = 0.0
+            if 2400 < track_index < 2700:
+                progress = speed * np.cos(angle)
+                custom_reward = progress - (abs(speed * np.sin(angle)) * 0.5)
 
-            # 6. Penalità Danni (Estrema)
-            damage_delta = obs['damage'] - prev_damage
-            damage_penalty = 0.0
-            if damage_delta > 0:
-                damage_penalty = -20000.0
-                done = True
-
-            custom_reward = progress - (0.5 * drift_penalty) - (0.1 * off_center_penalty) - vertical_penalty - speed_limit_penalty + damage_penalty
-
-            
-            # --- CONDIZIONI DI USCITA ---
-            if curr_lap_time < prev_lap_time and current_dist_raced > 3000:
-                print(f"!!! GIRO COMPLETATO !!! Tempo: {obs.get('lastLapTime', 0):.2f}s")
-                torch.save(actor.state_dict(), "actor_lap_complete.pth")
+            if current_dist_raced > 3610:
+                print(f"--- GIRO COMPLETATO! ---")
                 done = True
             
-            if abs(track_pos) > 1.8 or np.cos(angle) < -0.1:
-                done = True
-            
-            if steps > 30000: 
+            if abs(track_pos) > 2.1 or steps > 10000:
                 done = True
 
-            # Memoria e Training
             episode_reward += custom_reward
-            memory.push(state, raw_action, custom_reward, preprocess_state(obs), done)
+            memory.push(state, raw_action, custom_reward, preprocess_state(obs), done, track_index)
             state = preprocess_state(obs)
-            prev_damage = obs['damage']
-            prev_lap_time = curr_lap_time
-            max_dist_reached = max(max_dist_reached, current_dist_raced)
             steps += 1
 
-            if len(memory) > BATCH_SIZE and episode >= ACTOR_WARMUP_EPISODES:
-                b_state, b_action, b_reward, b_next_state, b_done = memory.sample(BATCH_SIZE)
+        if len(memory) > BATCH_SIZE and episode >= ACTOR_WARMUP_EPISODES:
+            updates = 50 
+            actor.train()
+            for _ in range(updates):
+                b_state, b_action, b_reward, b_next_state, b_done, b_track_idx = memory.sample(batch_size=BATCH_SIZE)
                 b_state, b_action, b_reward = torch.FloatTensor(b_state), torch.FloatTensor(b_action), torch.FloatTensor(b_reward).unsqueeze(1)
                 b_next_state, b_done = torch.FloatTensor(b_next_state), torch.FloatTensor(b_done).unsqueeze(1)
 
@@ -268,42 +217,34 @@ def reinforce():
                 critic_optimizer.zero_grad(); critic_loss.backward(); critic_optimizer.step()
 
                 pred_a = actor(b_state)
-                rl_loss = -critic(b_state, pred_a).mean()
+                rl_losses = -critic(b_state, pred_a) * 0.01 
                 with torch.no_grad(): exp_a = expert_anchor(b_state)
-                imit_loss = F.mse_loss(pred_a, exp_a)
+                imit_losses = F.mse_loss(pred_a, exp_a, reduction='none').mean(dim=1, keepdim=True)
                 
-                w = max(IMITATION_WEIGHT_END, IMITATION_WEIGHT_START - (episode/IMITATION_DECAY_EPISODES))
-                total_loss = (1-w)*rl_loss + w*imit_loss
-                actor_optimizer.zero_grad(); total_loss.backward(); actor_optimizer.step()
-                update_targets(target_actor, actor, TAU)
+                actor_mask = torch.FloatTensor([1.0 if 2400 < t < 2700 else 0.0 for t in b_track_idx]).to(pred_a.device).unsqueeze(1)
+                b_weights = torch.FloatTensor([IMITATION_WEIGHT_CORK if 2400 < t < 2700 else 1.0 for t in b_track_idx]).to(pred_a.device).unsqueeze(1)
+                
+                if actor_mask.sum() > 0:
+                    total_loss = (actor_mask * ((1.0 - b_weights) * rl_losses + b_weights * imit_losses)).sum() / actor_mask.sum()
+                    actor_optimizer.zero_grad(); total_loss.backward(); actor_optimizer.step()
+                    update_targets(target_actor, actor, TAU)
                 update_targets(target_critic, critic, TAU)
 
-        if max_dist_reached > best_dist:
-            best_dist = max_dist_reached
-            torch.save(actor.state_dict(), "actor_best.pth")
-            print(f"--- NUOVO RECORD DISTANZA: {best_dist:.1f}m ---")
-
-        if episode > 0 and episode % 10 == 0:
-            version_path = f"brains/actor_ep{episode}.pth"
-            torch.save(actor.state_dict(), version_path)
-            torch.save(actor.state_dict(), "optimized_actor.pth")
-            print(f">>> AUTO-SAVE: {version_path} salvato.")
-
-        log_writer.writerow([episode, steps, episode_reward, obs.get('lastLapTime', 0), max_dist_reached])
+        log_writer.writerow([episode, steps, episode_reward, obs.get('lastLapTime', 0), current_dist_raced])
         log_file.flush()
-        print(f"Fine Ep {episode} | Step: {steps} | Dist: {max_dist_reached:.1f}m | Rew: {episode_reward:.1f}")
+        print(f"Ep {episode} | Dist: {current_dist_raced:.1f}m")
     
     log_file.close()
     env.end()
 
 def preprocess_state(S):
-    angle = np.array([S['angle']], dtype=np.float32) / 3.14159
-    gear = np.array([S['gear']], dtype=np.float32) / 6.0
-    rpm = np.array([S['rpm']], dtype=np.float32) / 10000.0
-    speed = np.array([S['speedX'], S['speedY'], S['speedZ']], dtype=np.float32) / 200.0
-    track = np.array(S['track'], dtype=np.float32) / 200.0
-    track_pos = np.array([S['trackPos']], dtype=np.float32) / 3.0
-    wheel_spin = np.array(S['wheelSpinVel'], dtype=np.float32) / 100.0
+    angle = np.array([S.get('angle', 0)], dtype=np.float32) / 3.14159
+    gear = np.array([S.get('gear', 1)], dtype=np.float32) / 6.0
+    rpm = np.array([S.get('rpm', 0)], dtype=np.float32) / 10000.0
+    speed = np.array([S.get('speedX', 0), S.get('speedY', 0), S.get('speedZ', 0)], dtype=np.float32) / 200.0
+    track = np.array(S.get('track', [0]*19), dtype=np.float32) / 200.0
+    track_pos = np.array([S.get('trackPos', 0)], dtype=np.float32) / 3.0
+    wheel_spin = np.array(S.get('wheelSpinVel', [0]*4), dtype=np.float32) / 100.0
     return np.concatenate([angle, gear, rpm, speed, track, track_pos, wheel_spin])
 
 if __name__ == "__main__":

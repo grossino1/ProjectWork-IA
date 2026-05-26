@@ -1,0 +1,11 @@
+I modelli .pth sono in grado di arrivare con costanza al cavatappi. Si schiantano sempre a 2477.7m;
+Non gli è stato ancora insegnato altro, ma stando su tempi buoni ho preferito caricarvelo in modo che possiate lavorarci anche voi
+
+Ai file della cartella dovete aggiungere tutti gli altri base di gym_torcs (.xml, .json,....)
+
+il file stabletest.py permette di testare il modello senza modificarne l'apprendimento o le capacità 
+(per vedere se funziona anche a voi provate a lanciarlo e vedete se arriva sempre al cavatappi)
+
+il file reinforce_optimization è quello che stavo usando per il reinforcement ma non andava bene, quindi provate a modificarlo
+
+il resto sono file creati da gemini per fare verifiche ecc.
