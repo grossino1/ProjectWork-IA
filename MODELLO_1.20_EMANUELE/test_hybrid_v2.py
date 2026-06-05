@@ -8,15 +8,6 @@ LOGICA:
   - Zona di transizione (2300-2400m e 2750-2850m)    → blend lineare
   - Dentro il Corkscrew (2400-2750m)                 → 100% CASO2 BEST
 
-  Nessuna modifica ai pesi. Solo inferenza pura.
-
-USO:
-  python test_hybrid_corkscrew.py
-  python test_hybrid_corkscrew.py --cork actor_CASO2_best_laptime.pth --episodes 5
-  python test_hybrid_corkscrew.py --cork actor_CASO2_ep50.pth --episodes 3
-
-DIPENDENZE:
-  torch, numpy, gym_torcs (installati nel tuo ambiente TORCS)
 =============================================================================
 """
 
@@ -214,32 +205,9 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
             gear          = int(round(np.clip(blended[3], 0.0, 1.0) * 5.0 + 1.0))
             env_action[3] = float(max(1, min(6, gear)))
 
-            # ── Log ingresso zona Cork ──────────────────────────────────────
-            if track_idx > CORK_HARD_START - CORK_BLEND_ZONE and not cork_entry_logged:
-                cork_entry_speed = obs.get('speedX', 0.0) * 3.6
-                #print(f"\n  → INGRESSO ZONA BLEND a {track_idx:.1f}m | "
-                      #f"vel={cork_entry_speed:.1f} km/h")
-                cork_entry_logged = True
+            
 
-            # ── Log dettagliato zona Corkscrew (ogni 10m circa) ────────────
-            if 2300 < track_idx < 2800 and steps % 3 == 0:
-                speed     = obs.get('speedX', 0.0) * 3.6
-                track_pos = obs.get('trackPos', 0.0)
-                angle     = obs.get('angle', 0.0)
-                model_tag = (f"CORK α={alpha:.2f}"
-                             if alpha > 0.05 else "ANCHOR")
-               # print(f"  [{track_idx:6.1f}m] {model_tag:12s} | "
-                      #f"vel={speed:5.1f}km/h | pos={track_pos:+.2f} | "
-                     # f"ang={angle:+.4f} | "
-                     # f"acc={blended[1]:.2f} brk={blended[2]:.2f} g={gear}")
-
-            # ── Log punto critico ───────────────────────────────────────────
-            if abs(track_idx - CRITICAL_POINT) < 15.0 and not critical_logged:
-                speed = obs.get('speedX', 0.0) * 3.6
-                status = "✓ OK" if speed < 70.0 else "⚠ TROPPO VELOCE"
-                #print(f"\n  *** CRITICAL POINT {CRITICAL_POINT}m: "
-                #      f"vel={speed:.1f} km/h {status} ***\n")
-                critical_logged = True
+            
 
             # ── Step nell'ambiente ──────────────────────────────────────────
             try:
@@ -361,3 +329,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     test_hybrid(args.anchor, args.cork, args.episodes)
+
