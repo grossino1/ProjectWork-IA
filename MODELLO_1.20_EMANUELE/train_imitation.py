@@ -108,8 +108,8 @@ def train():
             print(f"Epoch [{epoch+1}/{EPOCHS}], Loss: {total_loss/len(loader):.6f}")
 
     # 4. Salvataggio
-    torch.save(model.state_dict(), "esctor_GOLDEN_STABLE.pth")
-    print("Modello salvato con successo: esctor_GOLDEN_STABLE.pth")
+    torch.save(model.state_dict(), "actor_GOLDEN_STABLE.pth")
+    print("Modello salvato con successo: actor_GOLDEN_STABLE.pth")
 
 if __name__ == "__main__":
     train()
