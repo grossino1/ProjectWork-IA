@@ -1,12 +1,15 @@
-"""
-=============================================================================
-TEST IBRIDO — Golden Stable + Caso2 al Corkscrew
+"""=============================================================================
+TEST — Golden Stable + Caso2 al Corkscrew
+
 =============================================================================
 
 LOGICA:
   - Fuori dalla zona Corkscrew (< 2300m e > 2850m)  → 100% GOLDEN STABLE
   - Zona di transizione (2300-2400m e 2750-2850m)    → blend lineare
   - Dentro il Corkscrew (2400-2750m)                 → 100% CASO2 BEST
+
+RESET MANUALE
+  -"Continue" -> "New Practice" in TORCS -> INVIO nel prompt
 
 =============================================================================
 """
@@ -16,13 +19,12 @@ import torch.nn as nn
 import numpy as np
 import time
 import argparse
-import csv
 import os
 
 from gym_torcs import TorcsEnv
 
 # ---------------------------------------------------------------------------
-# COSTANTI (devono essere identiche al training Caso2)
+# COSTANTI (identiche al training Caso2)
 # ---------------------------------------------------------------------------
 INPUT_SIZE  = 30
 OUTPUT_SIZE = 4
@@ -33,7 +35,7 @@ CORK_BLEND_ZONE = 100.0     # rampa di transizione in metri
 CRITICAL_POINT  = 2477.0    # cambio di pendenza
 
 # ---------------------------------------------------------------------------
-# ARCHITETTURA (deve essere identica al training — NON modificare)
+# ARCHITETTURA (identica al training — NON modificare)
 # ---------------------------------------------------------------------------
 class Actor(nn.Module):
     def __init__(self, input_size: int = INPUT_SIZE):
@@ -125,6 +127,7 @@ def load_model(path: str, label: str) -> Actor:
 def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
     print("\n" + "=" * 65)
     print("TEST IBRIDO: Golden Stable + Caso2 al Corkscrew")
+    print("(RESET MANUALE DA TORCS)")
     print("=" * 65)
     print(f"  Modello FUORI Cork: {anchor_path}")
     print(f"  Modello DENTRO Cork: {cork_path}")
@@ -140,15 +143,6 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
 
     env = TorcsEnv(vision=False, throttle=True, gear_change=True)
 
-    # ---- Log su CSV ----
-    log_path   = "test_hybrid_results.csv"
-    log_file   = open(log_path, "w", newline="")
-    log_writer = csv.writer(log_file)
-    log_writer.writerow([
-        "episode", "max_dist_from_start", "dist_raced",
-        "lap_time", "completed", "crash_point", "steps"
-    ])
-
     results = []
 
     for episode in range(1, n_episodes + 1):
@@ -156,17 +150,31 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
         print(f"EPISODIO {episode}/{n_episodes}")
         print(f"{'─' * 65}")
 
-        # ---- Connessione TORCS ----
+        # ★ RESET MANUALE: Aspetta istruzioni dall'utente ★
+        if episode > 1:
+            print("\n EPISODIO TERMINATO")
+            print("\n COSA FARE:")
+            print("  'Continue'->'New Practice'->INVIO")
+            print("\n" + "─" * 65)
+            input("▶ Premi INVIO quando sei pronto in TORCS >>> ")
+            print("▶ Connessione in corso...\n")
+
+        # ---- Connessione TORCS (con retry) ----
         connected = False
-        relaunch  = (episode == 1)
+        attempt = 0
         while not connected:
+            attempt += 1
             try:
-                env.reset(relaunch=relaunch)
+                # Primo episodio: relaunch=True
+                # Episodi successivi: relaunch=False 
+                env.reset(relaunch=(episode == 1))
                 connected = True
+                print(f"  ✓ Connesso a TORCS (tentativo {attempt})")
             except Exception as e:
-                print(f"  [TORCS] Retry connessione: {e}")
-                relaunch = True
-                time.sleep(5.0)
+                print(f"  ✗ Errore connessione: {e}")
+                print(f"  ⏳ Riprovo tra 3 secondi...")
+                print(f"     (Verifica che TORCS sia in 'New Practice')")
+                time.sleep(3.0)
 
         obs              = env.client.S.d
         state            = preprocess_state(obs)
@@ -178,11 +186,9 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
         lap_completed    = False
         crash_point      = None
 
-        # Stato zona Cork per il log
-        cork_entry_speed   = None
-        cork_entry_logged  = False
-        critical_logged    = False
+        print(f"  ✓ Episodio {episode} avviato\n")
 
+        # ---- Esecuzione episodio ----
         while not done:
             state_t   = torch.FloatTensor(state).unsqueeze(0)
             track_idx = float(obs.get('distFromStart', 0.0))
@@ -194,7 +200,7 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
                 anchor_action = anchor(state_t).numpy()[0]
                 cork_action   = cork_actor(state_t).numpy()[0]
 
-            # Blend deterministico (nessun rumore — solo test)
+            # Blend deterministico (solo test)
             blended = (1.0 - alpha) * anchor_action + alpha * cork_action
 
             # Costruzione azione per l'ambiente
@@ -204,10 +210,6 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
             env_action[2] = np.clip(blended[2],  0.0,  1.0)   # brake
             gear          = int(round(np.clip(blended[3], 0.0, 1.0) * 5.0 + 1.0))
             env_action[3] = float(max(1, min(6, gear)))
-
-            
-
-            
 
             # ── Step nell'ambiente ──────────────────────────────────────────
             try:
@@ -228,8 +230,7 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
 
             # ── Condizioni di terminazione ──────────────────────────────────
             if dist_raced > 3610:
-                lap_time = obs.get('lastLapTime', 0.0)
-                print(f"\n  ✓ GIRO COMPLETATO! Lap time: {lap_time:.2f}s")
+                print(f"\n  ✓ GIRO COMPLETATO!")
                 lap_completed = True
                 done = True
 
@@ -247,30 +248,19 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
             steps += 1
 
         # ── Fine episodio ───────────────────────────────────────────────────
-        lap_time = obs.get('lastLapTime', 0.0) if obs else 0.0
         results.append({
             'episode':   episode,
             'max_dist':  max_dist,
             'dist_raced': dist_raced,
-            'lap_time':  lap_time,
             'completed': lap_completed,
             'crash':     crash_point,
             'steps':     steps,
         })
 
-        log_writer.writerow([
-            episode, f"{max_dist:.1f}", f"{dist_raced:.1f}",
-            f"{lap_time:.2f}", lap_completed,
-            f"{crash_point:.1f}" if crash_point else "",
-            steps
-        ])
-        log_file.flush()
-
         summary = "✓ COMPLETO" if lap_completed else f"✗ crash a {crash_point:.1f}m" if crash_point else "✗ timeout"
         print(f"\n  Ep {episode}: {summary} | max_dist={max_dist:.1f}m | "
-              f"lap={lap_time:.2f}s | steps={steps}")
+              f"steps={steps}")
 
-    log_file.close()
     env.end()
 
     # ── Riepilogo finale ────────────────────────────────────────────────────
@@ -280,7 +270,7 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
 
     for r in results:
         if r['completed']:
-            status = f"✓ COMPLETO  lap={r['lap_time']:.2f}s"
+            status = "✓ COMPLETO"
         elif r['crash']:
             status = f"✗ crash a {r['crash']:.1f}m"
         else:
@@ -297,15 +287,8 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
     print(f"Crash prima del Cork: {len(crashes_before_cork)}/{len(results)}")
     print(f"Crash al Cork:        {len(crashes_at_cork)}/{len(results)}")
 
-    if completed:
-        best_lt = min(r['lap_time'] for r in completed)
-        avg_lt  = np.mean([r['lap_time'] for r in completed])
-        print(f"Miglior lap time:     {best_lt:.2f}s")
-        print(f"Lap time medio:       {avg_lt:.2f}s")
-
     avg_max = np.mean([r['max_dist'] for r in results])
     print(f"Distanza media max:   {avg_max:.1f}m")
-    print(f"\nLog salvato in: {log_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -329,4 +312,3 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     test_hybrid(args.anchor, args.cork, args.episodes)
-
