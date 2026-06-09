@@ -1,45 +1,58 @@
-"""=============================================================================
-TEST — Golden Stable + Caso2 al Corkscrew
-
-=============================================================================
-
-LOGICA:
-  - Fuori dalla zona Corkscrew (< 2300m e > 2850m)  → 100% GOLDEN STABLE
-  - Zona di transizione (2300-2400m e 2750-2850m)    → blend lineare
-  - Dentro il Corkscrew (2400-2750m)                 → 100% CASO2 BEST
-
-RESET MANUALE
-  -"Continue" -> "New Practice" in TORCS -> INVIO nel prompt
-
-=============================================================================
-"""
+# =============================================================================
+# test_hybrid_v2.py — FASE 3: Test del Sistema Ibrido Finale
+# =============================================================================
+# SCOPO DEL FILE:
+#   Questo script esegue il test del sistema ibrido completo.
+#   Carica i due modelli addestrati (actor_Golden_Stable.pth + actor_caso2_best_dist.pth) e li combina
+#   in tempo reale durante la guida, usando il Blend Factor spaziale per
+#   decidere quale modello comanda l'auto in base alla posizione sulla pista.
+#   NON esegue nessun aggiornamento dei pesi — è pura inferenza.
+#
+# FLUSSO:
+#   1. Carica actor_GOLDEN_STABLE.pth  (Imitation Learning — guida base)
+#   2. Carica actor_CASO2_best_dist.pth (DDPG RL — specialista Corkscrew)
+#   3. Per ogni step: calcola alpha(distFromStart), blenda i due output
+#   4. Registra i risultati su test_hybrid_results.csv
+# =============================================================================
 
 import torch
 import torch.nn as nn
 import numpy as np
 import time
 import argparse
+import csv
 import os
 
-from gym_torcs import TorcsEnv
+from gym_torcs import TorcsEnv  # wrapper OpenAI Gym per TORCS
 
-# ---------------------------------------------------------------------------
-# COSTANTI (identiche al training Caso2)
-# ---------------------------------------------------------------------------
-INPUT_SIZE  = 30
-OUTPUT_SIZE = 4
+# =============================================================================
+# COSTANTI — devono essere IDENTICHE a quelle usate in reinforce_optimization.py
+# =============================================================================
+# Se questi valori differissero dal training, il blend si attiverebbe in zone
+# diverse rispetto a quelle su cui il Cork Actor è stato addestrato, causando
+# comportamenti imprevedibili.
+INPUT_SIZE  = 30    # dimensione vettore di stato (30 sensori normalizzati)
+OUTPUT_SIZE = 4     # steer, accel, brake, gear
 
-CORK_HARD_START = 2400.0
-CORK_HARD_END   = 2750.0
-CORK_BLEND_ZONE = 100.0     # rampa di transizione in metri
-CRITICAL_POINT  = 2477.0    # cambio di pendenza
+CORK_HARD_START = 2400.0   # distanza (m) inizio zona Corkscrew — controllo 100% RL
+CORK_HARD_END   = 2750.0   # distanza (m) fine zona Corkscrew
+CORK_BLEND_ZONE = 100.0    # ampiezza (m) delle rampe di transizione lineare
+CRITICAL_POINT  = 2477.0   # metro esatto del cambio di pendenza (svalicamento cieco)
 
-# ---------------------------------------------------------------------------
-# ARCHITETTURA (identica al training — NON modificare)
-# ---------------------------------------------------------------------------
+
+# =============================================================================
+# ARCHITETTURA DELLA RETE NEURALE — Actor (identica al training)
+# =============================================================================
+# CRITICO: questa classe deve essere identica a quella usata
+# durante il training. Se cambia anche un solo layer, il load_state_dict()
+# fallisce perché le forme dei tensori non corrispondono.
+# =============================================================================
 class Actor(nn.Module):
     def __init__(self, input_size: int = INPUT_SIZE):
         super().__init__()
+
+        # Base condivisa: 3 layer densi con LayerNorm e ReLU
+        # Struttura: 30 → 128 → 128 → 64 neuroni
         self.base = nn.Sequential(
             nn.Linear(input_size, 128),
             nn.LayerNorm(128),
@@ -51,24 +64,48 @@ class Actor(nn.Module):
             nn.LayerNorm(64),
             nn.ReLU(),
         )
-        self.steer_head = nn.Linear(64, 1)
-        self.accel_head = nn.Linear(64, 1)
-        self.brake_head = nn.Linear(64, 1)
-        self.gear_head  = nn.Linear(64, 1)
+
+        # 4 teste separate: ognuna calcola un singolo output continuo
+        self.steer_head = nn.Linear(64, 1)  # sterzo
+        self.accel_head = nn.Linear(64, 1)  # acceleratore
+        self.brake_head = nn.Linear(64, 1)  # freno
+        self.gear_head  = nn.Linear(64, 1)  # marcia (normalizzata)
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         features = self.base(state)
-        steer = torch.tanh(self.steer_head(features))
-        accel = torch.sigmoid(self.accel_head(features))
-        brake = torch.sigmoid(self.brake_head(features))
-        gear  = torch.sigmoid(self.gear_head(features))
+
+        # Attivazioni di output per vincolare i range fisici:
+        steer = torch.tanh(self.steer_head(features))    # [-1.0, +1.0]
+        accel = torch.sigmoid(self.accel_head(features)) # [0.0, 1.0]
+        brake = torch.sigmoid(self.brake_head(features)) # [0.0, 1.0]
+        gear  = torch.sigmoid(self.gear_head(features))  # [0.0, 1.0] → de-normalizzato dopo
+
+        # Restituisce tensore [batch, 4] con tutti e 4 i comandi
         return torch.cat([steer, accel, brake, gear], dim=-1)
 
 
-# ---------------------------------------------------------------------------
-# PREPROCESSING STATO (identico al training)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# PREPROCESSING DELLO STATO — identico a reinforce_optimization.py
+# =============================================================================
+# Converte il dizionario di sensori grezzi di TORCS in un vettore NumPy
+# normalizzato di 30 elementi, pronto per essere passato alla rete.
+#
+# ORDINE DEI 30 ELEMENTI:
+#   [0]     angle       / pi          → [-1, 1]
+#   [1]     gear        / 6.0         → [0, 1]
+#   [2]     rpm         / 10000       → [0, 1]
+#   [3-5]   speedX/Y/Z  / 200.0       → ~[-1, 1]
+#   [6-24]  track[0..18]/ 200.0       → [0, 1]  (19 sensori laser)
+#   [25]    trackPos    / 3.0         → [-0.33, 0.33]
+#   [26-29] wheelSpinVel/ 100.0       → [0, ~3]
+#
+# PERCHÉ QUESTO ORDINE SPECIFICO?
+#   Deve essere identico all'ordine usato in train_imitation.py e
+#   reinforce_optimization.py. Se l'ordine cambia, la rete riceve
+#   le feature nei posti sbagliati e produce output insensati.
+# =============================================================================
 def preprocess_state(S: dict) -> np.ndarray:
+    # Funzione helper: legge un valore dal dizionario, ritorna default=0.0 se assente
     def g(k, d=0.0): return float(S.get(k, d))
 
     angle     = np.array([g('angle')],    dtype=np.float32) / 3.14159
@@ -82,52 +119,71 @@ def preprocess_state(S: dict) -> np.ndarray:
     wheel     = np.array(S.get('wheelSpinVel', [0]*4),
                          dtype=np.float32) / 100.0
 
+    # np.concatenate unisce tutti i vettori in un unico array monodimensionale X ∈ R^30
     return np.concatenate([angle, gear, rpm, speed, track, track_pos, wheel])
 
 
-# ---------------------------------------------------------------------------
-# BLEND ACTOR/ANCHOR (identico al training Caso2)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# BLEND FACTOR — funzione di miscelazione spaziale α(s)
+# =============================================================================
+# Calcola il coefficiente alpha che determina quanto "peso" dare al Cork Actor
+# rispetto al Golden Stable in base alla posizione sulla pista (in metri).
+#
+# COMPORTAMENTO:
+#   α = 0.0 → 100% Golden Stable (Imitation Learning)   [fuori dal Corkscrew]
+#   α = 1.0 → 100% Cork Actor (Reinforcement Learning)  [dentro il Corkscrew]
+#   0 < α < 1 → blend lineare (zona di transizione, 100m alle soglie)
+#
+# FORMULA NELLE ZONE DI TRANSIZIONE:
+#   Ingresso: α = (s - 2300) / 100  (da 2300m a 2400m)
+#   Uscita:   α = 1 - (s - 2750) / 100  (da 2750m a 2850m)
+#
+# PERCHÉ LE RAMPE LINEARI?
+#   Senza rampe, il passaggio istantaneo da un modello all'altro a 150 km/h
+#   produrrebbe un gradino nel comando di sterzo o freno, destabilizzando l'auto.
+# =============================================================================
 def compute_blend_factor(track_idx: float) -> float:
-    """
-    Restituisce α ∈ [0, 1]:
-      α = 0  → 100% golden stable (anchor)
-      α = 1  → 100% cork actor (caso2)
-    """
+    # Prima della zona blend in ingresso → tutto Golden Stable
     if track_idx < CORK_HARD_START - CORK_BLEND_ZONE:
         return 0.0
+    # Dopo la zona blend in uscita → tutto Golden Stable
     if track_idx > CORK_HARD_END + 200:
         return 0.0
+    # Rampa lineare di ingresso (2300m → 2400m): alpha sale da 0 a 1
     if track_idx < CORK_HARD_START:
         return (track_idx - (CORK_HARD_START - CORK_BLEND_ZONE)) / CORK_BLEND_ZONE
+    # Zona piena Corkscrew (2400m → 2750m): tutto Cork Actor
     if track_idx <= CORK_HARD_END:
         return 1.0
+    # Rampa lineare di uscita (2750m → 2850m): alpha scende da 1 a 0
     return 1.0 - (track_idx - CORK_HARD_END) / CORK_BLEND_ZONE
 
 
-# ---------------------------------------------------------------------------
-# CARICAMENTO MODELLI con verifica
-# ---------------------------------------------------------------------------
+# =============================================================================
+# CARICAMENTO MODELLI
+# =============================================================================
 def load_model(path: str, label: str) -> Actor:
+    # Verifica che il file esista prima di tentare il caricamento
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"Modello '{label}' non trovato: {path}\n"
             f"Assicurati che il file esista nella directory corrente."
         )
     model = Actor(INPUT_SIZE)
+    # map_location="cpu": carica il modello sulla CPU anche se era stato
+    # salvato su GPU. Necessario per eseguire su macchine senza CUDA.
     model.load_state_dict(torch.load(path, map_location="cpu"))
-    model.eval()
+    model.eval()  # disabilita dropout e BatchNorm in modalità training
     print(f"  [OK] {label}: {path}")
     return model
 
 
-# ---------------------------------------------------------------------------
-# TEST PRINCIPALE
-# ---------------------------------------------------------------------------
+# =============================================================================
+# FUNZIONE DI TEST PRINCIPALE
+# =============================================================================
 def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
     print("\n" + "=" * 65)
     print("TEST IBRIDO: Golden Stable + Caso2 al Corkscrew")
-    print("(RESET MANUALE DA TORCS)")
     print("=" * 65)
     print(f"  Modello FUORI Cork: {anchor_path}")
     print(f"  Modello DENTRO Cork: {cork_path}")
@@ -136,147 +192,195 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
     print(f"  Episodi: {n_episodes}")
     print("=" * 65)
 
-    # ---- Caricamento ----
+    # Carica entrambi i modelli in memoria
     print("\nCaricamento modelli...")
-    anchor     = load_model(anchor_path, "Golden Stable (anchor)")
-    cork_actor = load_model(cork_path,   "Cork Actor (caso2)")
+    anchor     = load_model(anchor_path, "Golden Stable (anchor)")  # modello IL
+    cork_actor = load_model(cork_path,   "Cork Actor (caso2)")      # modello RL
 
+    # Inizializza l'ambiente TORCS:
+    # vision=False: niente camera, usa solo sensori numerici
+    # throttle=True: controllo separato accel e brake (non throttle unificato)
+    # gear_change=True: la rete può cambiare marcia
     env = TorcsEnv(vision=False, throttle=True, gear_change=True)
 
-    results = []
+    # Apre il file CSV per registrare i risultati di ogni episodio
+    log_path   = "test_hybrid_results.csv"
+    log_file   = open(log_path, "w", newline="")
+    log_writer = csv.writer(log_file)
+    log_writer.writerow([
+        "episode", "max_dist_from_start", "dist_raced",
+        "lap_time", "completed", "crash_point", "steps"
+    ])
 
+    results = []  # lista dei risultati per il riepilogo finale
+
+    # =========================================================================
+    # LOOP DEGLI EPISODI
+    # =========================================================================
     for episode in range(1, n_episodes + 1):
         print(f"\n{'─' * 65}")
         print(f"EPISODIO {episode}/{n_episodes}")
         print(f"{'─' * 65}")
 
-        # ★ RESET MANUALE: Aspetta istruzioni dall'utente ★
-        if episode > 1:
-            print("\n EPISODIO TERMINATO")
-            print("\n COSA FARE:")
-            print("  'Continue'->'New Practice'->INVIO")
-            print("\n" + "─" * 65)
-            input("▶ Premi INVIO quando sei pronto in TORCS >>> ")
-            print("▶ Connessione in corso...\n")
-
-        # ---- Connessione TORCS (con retry) ----
+        # Connessione a TORCS con retry automatico in caso di errore
+        # relaunch=True al primo episodio: avvia TORCS fresh
+        # relaunch=False negli episodi successivi: usa il Soft Reset (4.5s vs 22s)
         connected = False
-        attempt = 0
+        relaunch  = (episode == 1)
         while not connected:
-            attempt += 1
             try:
-                # Primo episodio: relaunch=True
-                # Episodi successivi: relaunch=False 
-                env.reset(relaunch=(episode == 1))
+                env.reset(relaunch=relaunch)
                 connected = True
-                print(f"  ✓ Connesso a TORCS (tentativo {attempt})")
             except Exception as e:
-                print(f"  ✗ Errore connessione: {e}")
-                print(f"  ⏳ Riprovo tra 3 secondi...")
-                print(f"     (Verifica che TORCS sia in 'New Practice')")
-                time.sleep(3.0)
+                print(f"  [TORCS] Retry connessione: {e}")
+                relaunch = True
+                time.sleep(5.0)
 
-        obs              = env.client.S.d
-        state            = preprocess_state(obs)
-        start_dist_raced = obs.get('distRaced', 0.0)
+        # Stato iniziale del simulatore
+        obs              = env.client.S.d       # dizionario sensori TORCS
+        state            = preprocess_state(obs) # vettore NumPy normalizzato
+        start_dist_raced = obs.get('distRaced', 0.0)  # distanza percorsa a inizio episodio
         done             = False
         steps            = 0
-        max_dist         = 0.0
-        dist_raced       = 0.0
+        max_dist         = 0.0       # distanza massima raggiunta (distFromStart)
+        dist_raced       = 0.0       # distanza percorsa nell'episodio
         lap_completed    = False
-        crash_point      = None
+        crash_point      = None      # metro dove è avvenuto il crash
 
-        print(f"  ✓ Episodio {episode} avviato\n")
+        # Variabili di log per la zona Cork (non usate nell'output finale ma utili per debug)
+        cork_entry_speed   = None
+        cork_entry_logged  = False
+        critical_logged    = False
 
-        # ---- Esecuzione episodio ----
+        # =====================================================================
+        # LOOP DI CONTROLLO — un'iterazione = un time step del simulatore
+        # =====================================================================
         while not done:
+            # Converte lo stato in tensore PyTorch [1, 30] (batch size 1)
             state_t   = torch.FloatTensor(state).unsqueeze(0)
+
+            # Legge la posizione sulla pista per calcolare il blend factor
             track_idx = float(obs.get('distFromStart', 0.0))
             alpha     = compute_blend_factor(track_idx)
 
+            # Aggiorna la distanza massima raggiunta
             max_dist = max(max_dist, track_idx)
 
-            with torch.no_grad():
-                anchor_action = anchor(state_t).numpy()[0]
-                cork_action   = cork_actor(state_t).numpy()[0]
+            # ---- INFERENZA PARALLELA DEI DUE MODELLI ----
+            with torch.no_grad():  # disabilita il calcolo dei gradienti (non serve in test)
+                anchor_action = anchor(state_t).numpy()[0]     # output Golden Stable [4]
+                cork_action   = cork_actor(state_t).numpy()[0]  # output Cork Actor [4]
 
-            # Blend deterministico (solo test)
+            # ---- BLEND DETERMINISTICO (nessun rumore in test) ----
+            # Formula: u_finale = (1-α)*u_IL + α*u_RL
+            # α=0 → 100% Golden Stable, α=1 → 100% Cork Actor
             blended = (1.0 - alpha) * anchor_action + alpha * cork_action
 
-            # Costruzione azione per l'ambiente
+            # ---- COSTRUZIONE AZIONE FINALE ----
             env_action    = blended.copy()
-            env_action[0] = np.clip(blended[0], -1.0,  1.0)   # steer
-            env_action[1] = np.clip(blended[1],  0.0,  1.0)   # accel
-            env_action[2] = np.clip(blended[2],  0.0,  1.0)   # brake
-            gear          = int(round(np.clip(blended[3], 0.0, 1.0) * 5.0 + 1.0))
-            env_action[3] = float(max(1, min(6, gear)))
+            env_action[0] = np.clip(blended[0], -1.0,  1.0)   # steer: vincola in [-1, 1]
+            env_action[1] = np.clip(blended[1],  0.0,  1.0)   # accel: vincola in [0, 1]
+            env_action[2] = np.clip(blended[2],  0.0,  1.0)   # brake: vincola in [0, 1]
 
-            # ── Step nell'ambiente ──────────────────────────────────────────
+            # De-normalizza la marcia: da [0,1] a intero [1,6]
+            # Formula inversa: gear_int = round(gear_norm * 5 + 1)
+            gear          = int(round(np.clip(blended[3], 0.0, 1.0) * 5.0 + 1.0))
+            env_action[3] = float(max(1, min(6, gear)))  # clamp a [1, 6]
+
+            # ---- STEP NEL SIMULATORE ----
+            # Invia i comandi a TORCS e riceve il nuovo stato
             try:
                 _, _, env_done, _ = env.step(env_action)
-                if env_done:
+                if env_done:  # TORCS ha segnalato la fine dell'episodio
                     done = True
             except Exception as e:
                 print(f"  [TORCS] Errore step: {e}")
                 done = True
                 break
 
+            # Aggiorna lo stato per il prossimo step
             obs = env.client.S.d
             if not obs:
                 break
 
+            # Calcola la distanza percorsa dall'inizio dell'episodio
             dist_raced = obs.get('distRaced', 0.0) - start_dist_raced
             track_pos  = obs.get('trackPos', 0.0)
 
-            # ── Condizioni di terminazione ──────────────────────────────────
+            # ---- CONDIZIONI DI TERMINAZIONE DELL'EPISODIO ----
+
+            # 1. GIRO COMPLETATO: dist_raced > 3610m (lunghezza pista Corkscrew)
             if dist_raced > 3610:
-                print(f"\n  ✓ GIRO COMPLETATO!")
+                lap_time = obs.get('lastLapTime', 0.0)
+                print(f"\n  ✓ GIRO COMPLETATO! Lap time: {lap_time:.2f}s")
                 lap_completed = True
                 done = True
 
+            # 2. USCITA DI PISTA: |trackPos| > 2.1 (oltre i cordoli)
             elif abs(track_pos) > 2.1:
                 crash_point = track_idx
                 print(f"\n  ✗ SCHIANTO al metro {track_idx:.1f}m "
                       f"(trackPos={track_pos:.2f})")
                 done = True
 
+            # 3. TIMEOUT: troppi step senza completare il giro
             elif steps > 12000:
                 print(f"\n  ✗ TIMEOUT ({steps} step senza completare il giro)")
                 done = True
 
+            # Preprocessing per il prossimo step
             state  = preprocess_state(obs)
             steps += 1
 
-        # ── Fine episodio ───────────────────────────────────────────────────
+        # =====================================================================
+        # FINE EPISODIO — registra risultati
+        # =====================================================================
+        lap_time = obs.get('lastLapTime', 0.0) if obs else 0.0
         results.append({
-            'episode':   episode,
-            'max_dist':  max_dist,
+            'episode':    episode,
+            'max_dist':   max_dist,
             'dist_raced': dist_raced,
-            'completed': lap_completed,
-            'crash':     crash_point,
-            'steps':     steps,
+            'lap_time':   lap_time,
+            'completed':  lap_completed,
+            'crash':      crash_point,
+            'steps':      steps,
         })
 
-        summary = "✓ COMPLETO" if lap_completed else f"✗ crash a {crash_point:.1f}m" if crash_point else "✗ timeout"
+        # Scrive la riga sul CSV e svuota il buffer (flush) per sicurezza
+        log_writer.writerow([
+            episode, f"{max_dist:.1f}", f"{dist_raced:.1f}",
+            f"{lap_time:.2f}", lap_completed,
+            f"{crash_point:.1f}" if crash_point else "",
+            steps
+        ])
+        log_file.flush()
+
+        summary = ("✓ COMPLETO" if lap_completed
+                   else f"✗ crash a {crash_point:.1f}m" if crash_point
+                   else "✗ timeout")
         print(f"\n  Ep {episode}: {summary} | max_dist={max_dist:.1f}m | "
-              f"steps={steps}")
+              f"lap={lap_time:.2f}s | steps={steps}")
 
-    env.end()
+    log_file.close()
+    env.end()  # chiude TORCS
 
-    # ── Riepilogo finale ────────────────────────────────────────────────────
+    # =========================================================================
+    # RIEPILOGO FINALE — statistiche aggregate su tutti gli episodi
+    # =========================================================================
     print("\n" + "=" * 65)
     print("RIEPILOGO FINALE")
     print("=" * 65)
 
     for r in results:
         if r['completed']:
-            status = "✓ COMPLETO"
+            status = f"✓ COMPLETO  lap={r['lap_time']:.2f}s"
         elif r['crash']:
             status = f"✗ crash a {r['crash']:.1f}m"
         else:
             status = f"✗ timeout a {r['max_dist']:.1f}m"
         print(f"  Ep {r['episode']:2d}: {status}")
 
+    # Statistiche di completamento e crash
     completed = [r for r in results if r['completed']]
     crashes_before_cork = [r for r in results
                            if r['crash'] and r['crash'] < CORK_HARD_START]
@@ -287,13 +391,25 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
     print(f"Crash prima del Cork: {len(crashes_before_cork)}/{len(results)}")
     print(f"Crash al Cork:        {len(crashes_at_cork)}/{len(results)}")
 
+    if completed:
+        best_lt = min(r['lap_time'] for r in completed)
+        avg_lt  = np.mean([r['lap_time'] for r in completed])
+        print(f"Miglior lap time:     {best_lt:.2f}s")
+        print(f"Lap time medio:       {avg_lt:.2f}s")
+
     avg_max = np.mean([r['max_dist'] for r in results])
     print(f"Distanza media max:   {avg_max:.1f}m")
+    print(f"\nLog salvato in: {log_path}")
 
 
-# ---------------------------------------------------------------------------
-# ENTRY POINT
-# ---------------------------------------------------------------------------
+# =============================================================================
+# ENTRY POINT — argomenti da linea di comando
+# =============================================================================
+# Utilizzo:
+#   python test_hybrid_v2.py                              → usa default
+#   python test_hybrid_v2.py --anchor mio_modello.pth    → modello custom
+#   python test_hybrid_v2.py --episodes 5                → 5 episodi
+# =============================================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Test ibrido: Golden Stable + Caso2 al Corkscrew"
