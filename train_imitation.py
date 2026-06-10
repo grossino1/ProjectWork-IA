@@ -6,7 +6,7 @@
 #   del Behavioral Cloning (BC). Legge il dataset di guida umana (manualtot.csv),
 #   e insegna alla rete a replicare i comandi del pilota dati i sensori della pista.
 #   L'output è il file "actor_GOLDEN_STABLE.pth" che contiene i pesi della rete
-#   addestrata, usato poi da test_hybrid_v2.py e reinforce_optimization.py.
+#   addestrata, usato poi da test.py e reinforce_optimization.py.
 # =============================================================================
 
 import torch
@@ -18,13 +18,15 @@ import os
 from torch.utils.data import DataLoader, TensorDataset
 
 # --- CONFIGURAZIONE GLOBALE ---
-# INPUT_SIZE=30: dimensione del vettore di stato (vedi preprocessing più sotto)
+# INPUT_SIZE=30: dimensione del vettore di stato, rappresentano i 30 sensori della macchina 
 # OUTPUT_SIZE=4: steer, accel, brake, gear
-# BATCH_SIZE=64: numero di campioni processati insieme ad ogni iterazione
-# EPOCHS=150: numero di passaggi completi sul dataset durante il training
-# LEARNING_RATE=0.001: velocità di aggiornamento dei pesi della rete neurale
-INPUT_SIZE = 30
-OUTPUT_SIZE = 4
+# BATCH_SIZE=64: numero di campioni processati insieme ad ogni iterazione, prima che la rete neurale aggiorni i neuroni
+# EPOCHS=150: numero di passaggi completi sul dataset durante l'addestramento della rete neurale
+# LEARNING_RATE=0.001: parametro che decide quanto pesantemente la rete deve "cambiare idea" dopo ogni errore commesso,
+# troppo alto apporta modifiche drastiche, mentre troppo basso apporta modifiche mminuscole 
+
+INPUT_SIZE = 30    #sensori acquisiti in ingresso, costante non utilizzata
+OUTPUT_SIZE = 4    #sensori che restituiamo, costante non utilizzata 
 BATCH_SIZE = 64
 EPOCHS = 150
 LEARNING_RATE = 0.001
@@ -34,7 +36,7 @@ LEARNING_RATE = 0.001
 # ARCHITETTURA DELLA RETE NEURALE — ExpertModel (Multi-Head)
 # =============================================================================
 # La rete usa un'architettura "Multi-Head" (a teste separate):
-#   - Una base comune (Shared Base) che estrae feature dai 30 sensori
+#   - Una base comune (Shared Base), a tre livelli, che estrae feature dai 30 sensori
 #   - 4 rami indipendenti (teste) che calcolano separatamente steer/accel/brake/gear
 #
 # PERCHÉ MULTI-HEAD?
@@ -43,9 +45,9 @@ LEARNING_RATE = 0.001
 #   permettono a ogni output di ottimizzarsi indipendentemente.
 #
 # STRUTTURA DELLA BASE COMUNE:
-#   Linear(30→128) + LayerNorm + ReLU
-#   Linear(128→128) + LayerNorm + ReLU
-#   Linear(128→64)  + LayerNorm + ReLU
+#   Linear(30→128) + LayerNorm + ReLU    -primo livello: Proietta i 30 sensori in uno spazio più grande (128 neuroni) per iniziare a creare correlazioni tra i sensori
+#   Linear(128→128) + LayerNorm + ReLU   -secondo livello: La dimensione non cambia, ma questo livello serve a estrarre caratteristiche di alto livello; invece di vedere solo i sensori la rete inzia a percepire concetti
+#   Linear(128→64)  + LayerNorm + ReLU   -terzo livello: Riducendo la dimensione costringiamo la rete a scartare il rumore e a tenere solo le informazioni essenziali.
 #
 # PERCHÉ LayerNorm E NON BatchNorm?
 #   LayerNorm normalizza ogni singolo campione indipendentemente, funziona
@@ -58,24 +60,27 @@ class ExpertModel(nn.Module):
         # Base comune: tre layer lineari densi con normalizzazione e attivazione ReLU
         self.base = nn.Sequential(
             nn.Linear(input_size, 128),  # 30 sensori → 128 neuroni
-            nn.LayerNorm(128),           # normalizza per stabilizzare i gradienti
-            nn.ReLU(),                   # attivazione non-lineare
+            nn.LayerNorm(128),           # normalizza tutti i dati dei sensori (molto divesri) in un intervallo omogeneo, per stabilizzare i gradienti, cioè i messaggi che vanno a modificare il neurone ad ogni errore
+            nn.ReLU(),                   # attivazione della logica non-lineare, i livelli densi fanno un calcolo lineare, con la funzione di non linearità permette al modello di imparare relazioni complesse.
             nn.Linear(128, 128),         # 128 → 128 (approfondisce la rappresentazione)
             nn.LayerNorm(128),
             nn.ReLU(),
-            nn.Linear(128, 64),          # 128 → 64 (comprime le feature più rilevanti)
+            nn.Linear(128, 64),          # 128 → 64 (comprime le feature più rilevanti), l'output di questo livello è un vettore di 64 numeri
             nn.LayerNorm(64),
             nn.ReLU(),
         )
 
-        # Teste separate: ogni testa produce UN solo valore di output
+        # Dall'utlimo Layer della base condivisa nascono 4 rami indipendenti (Teste), ogni ramo moltiplica i suoi pesi specifci(diversi per ogni ramo) 
+        # con tutti i 64 neuroni e li somma per ottenere un singolo  valore di output
         self.steer_head = nn.Linear(64, 1)  # sterzo
         self.accel_head = nn.Linear(64, 1)  # acceleratore
         self.brake_head = nn.Linear(64, 1)  # freno
         self.gear_head  = nn.Linear(64, 1)  # marcia
 
-    def forward(self, x):
-        # Propagazione attraverso la base comune
+        #nonostante usiamo nn.Linear(64, 1), per definire tutte le teste, ogni volta che scriviamo la riga andiamo a definire un'oggetto indipendente in memoria
+
+    def forward(self, x):   #La funzione forward viene chiamata automaticamente ogni volta che passi dei dati al modello, la x sarebbe il tensore con il valore di tutti i sensori
+        # I 30 sensori vengono propagati attraverso i livelli della base comune, in maniera tale che features contenga i 64 neuroni, che rappresentano la conoscenza condivisa delle teste 
         features = self.base(x)
 
         # Ogni testa produce il proprio output con la propria funzione di attivazione:
@@ -87,7 +92,8 @@ class ExpertModel(nn.Module):
         brake = torch.sigmoid(self.brake_head(features))
         gear  = torch.sigmoid(self.gear_head(features))  # scalato 0-1, poi convertito a marcia intera
 
-        # Concatena i 4 output in un unico vettore [steer, accel, brake, gear]
+        # Concatena i 4 output in un unico vettore [steer, accel, brake, gear], è fondamentale che l'ordine dei sensori messi in questo vettore rispetti
+        #l'ordine dei sensori messi nel CSV, perchè Il modello capisce qual è la testa del freno solo perché noi l'abbiamo collegata matematicamente alla colonna del freno nel tuo file dei dati.
         return torch.cat([steer, accel, brake, gear], dim=-1)
 
 
@@ -102,11 +108,11 @@ def train():
     # Il dataset manualtot.csv contiene la telemetria registrata durante la guida
     # manuale con controller DS4. Ogni riga è uno "snapshot" dello stato della
     # macchina + i comandi impartiti dal pilota in quel momento.
-    base_path = os.path.dirname(os.path.abspath(__file__))
-    dataset_path = os.path.join(base_path, "manualtot.csv")
+    base_path = os.path.dirname(os.path.abspath(__file__))   #prende la cartella del file dove ci troviamo
+    dataset_path = os.path.join(base_path, "manualtot.csv")    #prende dalla cartella dove ci troviamo il file dove abbiamo il dataset
     print(f"Loading dataset from: {dataset_path}")
     try:
-        data = pd.read_csv(dataset_path)
+        data = pd.read_csv(dataset_path)   #read_csv converte il file csv in data frame, strumento fondamentale per la gestione dei daati in python
     except FileNotFoundError:
         print(f"Errore: {dataset_path} non trovato.")
         return
@@ -118,17 +124,15 @@ def train():
     #               trackPos, wheelSpinVel×4)                              ← INPUT (X)
 
     # Separa input (X) e output (Y) in due matrici NumPy a precisione singola
-    y = data.iloc[:, 1:5].values.astype(np.float32)   # comandi del pilota
-    X = data.iloc[:, 5:].values.astype(np.float32)    # sensori del simulatore
+    y = data.iloc[:, 1:5].values.astype(np.float32)   # comandi del pilota, prende le righe dalla 1 alla 4
+    X = data.iloc[:, 5:].values.astype(np.float32)    # sensori del simulatore, prende tutte le le colonne dalla 5 fino alla fine
 
     # NORMALIZZAZIONE TARGET — Marcia da [1,6] a [0,1]:
-    # La testa gear usa sigmoid che produce [0,1], quindi la marcia reale
-    # va normalizzata nello stesso range durante il training.
-    # Formula: gear_norm = (gear_raw - 1) / 5
-    # Es: marcia 1 → 0.0, marcia 6 → 1.0
+    # La testa gear usa sigmoid che produce [0,1], quindi la marcia reale va normalizzata nello stesso range durante il training.
+    # Formula: gear_norm = (gear_raw - 1) / 5 Es: marcia 1 → 0.0, marcia 6 → 1.0
     y[:, 3] = (y[:, 3] - 1.0) / 5.0
 
-    input_dim = X.shape[1]  # sarà 30 se il CSV è corretto
+    input_dim = X.shape[1]  # sarà 30, calcola il numero di colonne, se il CSV è corretto, andiamo a calcolare il nnumero di sensori direttamente dal CSV, non utilizzando INPUT_SIZE
     print(f"Dimensioni rilevate: Input={input_dim}, Target={y.shape[1]}")
 
     # -------------------------------------------------------------------------
@@ -156,16 +160,18 @@ def train():
     # Infatti solo tramiti i Tensori PyTorch è possibile registrare le operazioni per poter calcolare automaticamente la retropropagazione dell'errore.
     X_tensor = torch.from_numpy(X)
     y_tensor = torch.from_numpy(y)
-    dataset  = TensorDataset(X_tensor, y_tensor)
+    dataset  = TensorDataset(X_tensor, y_tensor)   #una volta calcolati i tensori, TensorDataset crea una collezione di coppie (sensore, comando) per ogni episodio avremo 30 valori 
+    #per il tensore dei sensori e 4 per il tensore dei  comandi
 
     # shuffle=True: mescola i campioni ad ogni epoca per evitare che la rete
     # impari l'ordine temporale invece del comportamento di guida
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)  #il dataLoader trasforma il file in un flusso organizzato e casuale di dati
+    #prende dal dateset 64 (batch size) righe per volta in maniera casuale.
 
     # -------------------------------------------------------------------------
     # FASE 3: SETUP MODELLO E OTTIMIZZATORE
     # -------------------------------------------------------------------------
-    model     = ExpertModel(input_dim)   # rete neurale Multi-Head
+    model     = ExpertModel(input_dim)   # con questo comando creiamo la rete neurale che è pronta ad entrare nel training loop
     criterion = nn.MSELoss()             # usato solo come riferimento, vedi sotto
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     # Con queste tre righe avete materialmente messo in pista la macchina (model), stabilito che l'obiettivo è azzerare lo scarto quadratico rispetto all'uomo 
@@ -180,7 +186,6 @@ def train():
     # I pochi campioni con frenata forte (staccate) verrebbero ignorati.
     #
     # SOLUZIONE: Weighted MSE — assegna un peso maggiore ai campioni critici.
-    # Formula: L = (1/N) * Σ_i Σ_j w_{i,j} * (ŷ_{i,j} - y_{i,j})²
     #
     # Pesi assegnati:
     #   - Frenata (col 2): peso 6x se target_brake > 0.1
@@ -200,8 +205,9 @@ def train():
             # I sensori del batch corrente (batch_X) entrano nella rete neurale. 
             outputs = model(batch_X)  
 
-            # La rete esegue i calcoli attraverso la Shared Base e le 4 teste, sputando fuori la sua ipotesi di guida (outputs). In pratica, la rete dice: 
-            # "Secondo me, con questi sensori, dovrei sterzare di X, accelerare di Y, frenare di Z e mettere la marcia K".
+            # La rete esegue i calcoli attraverso la Shared Base e le 4 teste, sputando fuori la sua ipotesi di guida (outputs). 
+            #la rete neurale prende il batch che contiene 64 righe, con 30 valori per ogni riga, fa passare i valori per gli strati dei neuroni
+            #e restituisce come output una matrice di 64 righe che cotniene i 4 comandi che la rete pensa siano corretti
 
             # La rete crea una matrice di pesi che parte da 1.0 per tutti i comandi. Poi guarda cosa ha fatto l'uomo in quel batch:
             # Se l'uomo stava frenando (target_brake > 0.1), aggiunge $+5.0$ alla colonna del freno, che diventa 6.0 (Peso 6x).
@@ -232,7 +238,7 @@ def train():
     # FASE 5: SALVATAGGIO DEL MODELLO
     # -------------------------------------------------------------------------
     # state_dict() salva solo i pesi (non l'architettura).
-    # Il file .pth verrà caricato da test_hybrid_v2.py e reinforce_optimization.py.
+    # Il file .pth verrà caricato da test.py e reinforce_optimization.py.
     # IMPORTANTE: l'architettura ExpertModel deve essere identica in tutti gli script
     # che caricano questo file, altrimenti il load_state_dict() fallisce.
     torch.save(model.state_dict(), "actor_GOLDEN_STABLE.pth")
