@@ -141,7 +141,7 @@ def manual_recording():
             for i, th in enumerate([0, 45, 90, 145, 200, 250]):
                 if speed > th: target_gear = i + 1
             
-            # Mantieni la marcia in curva per stabilità (come nel codice originale)
+            # Mantieni la marcia in curva per stabilità 
             current_gear = S.d.get('gear', 1)
             gear = current_gear if abs(steer) > 0.4 else target_gear
 

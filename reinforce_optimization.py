@@ -39,11 +39,12 @@ OUTPUT_SIZE  = 4
 # Fattore di sconto temporale (Gamma): impostato a 0.99 (molto alto). 
 # Dice al Critic che il futuro conta quasi quanto il presente, costringendo l'auto 
 # a essere lungimirante e a sacrificare velocità immediata (frenando) pur di finire il giro.
+# Questo permette all'auto di frenare preventivamete quando arriva all'apice del cavatappi prima della curva cieca.
 GAMMA        = 0.99
 
 # Coefficiente di Soft Update (Tau): controlla la velocità delle reti ombra (Target).
-# Impostato a 0.005, significa che ad ogni passo le reti Target assimilano solo 
-# lo 0.5% dei pesi sinaptici delle reti Online, garantendo stabilità matematica.
+# Impostato a 0.005, significa che ad ogni passo le reti Target, cioè il modello che impara lentamente dal modello online,
+# assimilano solo lo 0.5% dei pesi sinaptici delle reti Online, garantendo stabilità matematica.
 TAU          = 0.005
 
 # Learning Rate dell'Actor (Il Pilota): impostato a 1e-4 (0.0001).
@@ -134,7 +135,7 @@ CRASH_DIST_TOL   = 50.0
 # Il suo ruolo qui: L'Actor parte con le conoscenze dell'essere umano, ma in questo script viene attivamente modificato dal Reinforcement Learning 
 # per scoprire nuove staccate millimetriche dentro il Corkscrew.
 class Actor(nn.Module):
-    def __init__(self, input_size: int = INPUT_SIZE):
+    def __init__(self, input_size: int = INPUT_SIZE):  #nel caso quando creiamo l'oggetto non specifichiamo nulla di default utilizza il valore della costante INPUT_SIZE
         super().__init__()
         self.base = nn.Sequential(
             nn.Linear(input_size, 128),
@@ -175,17 +176,20 @@ class Critic(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
+            nn.ReLUqu(),
+            nn.Linear(256, 1)   #viene compresso tutto in un neurone finale: prende i 256 valori dello stato precendente, moltiplica ognuno di essi per un
+                                #peso differente, somma tutto insieme e aggiunge un valore chiaamato  bias 
+
+            #il singolo neurone rappresenta il voto finala (il valore Q), che riassume tutte le definizione complesse dei 256 neuroni
         )
 
-    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        return self.network(torch.cat([state, action], dim=1))
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:    #il Critic riceve in input due dati lo state, la situazione attuale, l'action, la mossa che ha appena scelto l'Actor
+        return self.network(torch.cat([state, action], dim=1))   #una volta ottenuto il vettore tramite torch.cat di 34 elementi, lo facciamo passare nella rete neurale che ci restituirà il valore Q
 
 
-def soft_update(target: nn.Module, source: nn.Module, tau: float):
-    for tp, sp in zip(target.parameters(), source.parameters()):
-        tp.data.copy_(tp.data * (1.0 - tau) + sp.data * tau)
+def soft_update(target: nn.Module, source: nn.Module, tau: float):   #funzione utilizzata sia sul critic che sul actor, serve a far si che i modelli target seguona i progressi del modello online (source)
+    for tp, sp in zip(target.parameters(), source.parameters()):    #fa scorrere le liste dei neuroni target e online (source) e gli associa alias tp e sp
+        tp.data.copy_(tp.data * (1.0 - tau) + sp.data * tau)    #usa la funzione Media Mobile Esponenziale per calcolare il nuovo valore del modello target, partendo dal vecchio valore di target e dal valore del modello online(source)
 
 # ---------------------------------------------------------------------------
 # REPLAY BUFFER con prioritizzazione semplificata
@@ -206,19 +210,18 @@ class PrioritizedReplayBuffer:
     # Ogni volta che la macchina compie un'azione in pista, invoca questo metodo per salvare l'esperienza:
     def push(self, state, action, reward, next_state, done, track_idx):
         # Priorità iniziale: Cork zone vale di più
-        base_priority = 2.0 if CORK_HARD_START < track_idx < CORK_HARD_END else 1.0
-        self.buffer.append((state, action, reward, next_state, done, track_idx))
-        self.priorities.append(base_priority)
+        base_priority = 2.0 if CORK_HARD_START < track_idx < CORK_HARD_END else 1.0   #base_priority assegna l'importnaza del ricordo: se l'auto si trova tra l'inzio e la fine del cavatappi, l'importanza e pari a 2 altrimenti e pari ad 1
+        self.buffer.append((state, action, reward, next_state, done, track_idx))    #salvataggio del ricordo nel buffer
+        self.priorities.append(base_priority)     #nella lista parallela salviamo la priorità del ricordo. Corrispondenza: primo ricordo nel buffer avrà la prima priorità nella lista
 
     # Quando l'ottimizzatore deve aggiornare i neuroni, chiede al buffer un blocchetto di ricordi
     def sample(self, batch_size: int):
-        probs = np.array(self.priorities, dtype=np.float32) ** self.alpha
-        probs /= probs.sum()
+        probs = np.array(self.priorities, dtype=np.float32) ** self.alpha  #crea un array con le priorità, con esponente alpha in maniera tale da dare una probabilità di essere scelti anche i ricordi meno importanti
+        probs /= probs.sum()   #trasformiamo le priorità in probabilità vere e proprie
 
-        indices = np.random.choice(len(self.buffer), size=batch_size,
-                                   replace=False, p=probs)
-        samples = [self.buffer[i] for i in indices]
-        state, action, reward, next_state, done, track_idx = zip(*samples)
+        indices = np.random.choice(len(self.buffer), size=batch_size, replace=False, p=probs)   # np.random.choice pesca dalla lunghezza del buffer in maniera casuale, un numero di indici, associati ai ricordi, pari a size, senza reinserimento (una volta estratto un ricordo non posso ripescarlo), grazie a p=probs pescherà più spesso i ricordi del cavatappi
+        samples = [self.buffer[i] for i in indices]   #estrae i dati dal buffer per tutti i 256 (BATCH_SIZE) indici scelti
+        state, action, reward, next_state, done, track_idx = zip(*samples)   #zip trasforma la lista di pacchetti samples in righe separate
 
         # Importance sampling weights
         n = len(self.buffer)

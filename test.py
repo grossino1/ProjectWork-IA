@@ -1,9 +1,9 @@
 # =============================================================================
-# test_hybrid_v2.py — FASE 3: Test del Sistema Ibrido Finale
+# test.py —  Test del Sistema Ibrido Finale
 # =============================================================================
 # SCOPO DEL FILE:
 #   Questo script esegue il test del sistema ibrido completo.
-#   Carica i due modelli addestrati (actor_Golden_Stable.pth + actor_caso2_best_dist.pth) e li combina
+#   Carica i due modelli addestrati (actor_GOLDEN_Stable.pth + actor_CASO2_best_dist.pth) e li combina
 #   in tempo reale durante la guida, usando il Blend Factor spaziale per
 #   decidere quale modello comanda l'auto in base alla posizione sulla pista.
 #   NON esegue nessun aggiornamento dei pesi — è pura inferenza.
@@ -11,7 +11,7 @@
 # FLUSSO:
 #   1. Carica actor_GOLDEN_STABLE.pth  (Imitation Learning — guida base)
 #   2. Carica actor_CASO2_best_dist.pth (DDPG RL — specialista Corkscrew)
-#   3. Per ogni step: calcola alpha(distFromStart), blenda i due output
+#   3. Per ogni step: calcola alpha(distFromStart) e somma linearmente i due output
 #   4. Registra i risultati su test_hybrid_results.csv
 # =============================================================================
 
@@ -22,14 +22,13 @@ import time
 import argparse
 import csv
 import os
-
 from gym_torcs import TorcsEnv  # wrapper OpenAI Gym per TORCS
 
-# =============================================================================
-# COSTANTI — devono essere IDENTICHE a quelle usate in reinforce_optimization.py
-# =============================================================================
+# ====================================================================================================
+# COSTANTI — Devono essere IDENTICHE a quelle usate in reinforce_optimization.py e train_imitation.py
+# ====================================================================================================
 # Se questi valori differissero dal training, il blend si attiverebbe in zone
-# diverse rispetto a quelle su cui il Cork Actor è stato addestrato, causando
+# diverse rispetto a quelle su cui i modelli sono stati addestrati, causando
 # comportamenti imprevedibili.
 INPUT_SIZE  = 30    # dimensione vettore di stato (30 sensori normalizzati)
 OUTPUT_SIZE = 4     # steer, accel, brake, gear
@@ -39,20 +38,37 @@ CORK_HARD_END   = 2750.0   # distanza (m) fine zona Corkscrew
 CORK_BLEND_ZONE = 100.0    # ampiezza (m) delle rampe di transizione lineare
 CRITICAL_POINT  = 2477.0   # metro esatto del cambio di pendenza (svalicamento cieco)
 
-
-# =============================================================================
-# ARCHITETTURA DELLA RETE NEURALE — Actor (identica al training)
-# =============================================================================
-# CRITICO: questa classe deve essere identica a quella usata
-# durante il training. Se cambia anche un solo layer, il load_state_dict()
-# fallisce perché le forme dei tensori non corrispondono.
+# ======================================================================================================================
+# ARCHITETTURA DELLA RETE NEURALE — Actor (identica allla classe Actor del renforce e alla classe ExpertModel del train)
+# ======================================================================================================================
+# Questa classe deve essere identica a quella usata durante il training, perché se cambia anche un solo layer, il load_state_dict(),
+# che carica i pesi dei modelli addestrati, fallisce perché le forme dei tensori non corrispondono.
+# 
+# La rete usa un'architettura "Multi-Head" (a teste separate):
+#   - Una base comune (Shared Base) che estrae feature dai 30 sensori
+#   - 4 rami indipendenti (teste) che calcolano separatamente steer/accel/brake/gear
+#
+# PERCHÉ MULTI-HEAD?
+#   Se steer e brake condividessero lo stesso neurone di uscita, i loro gradienti
+#   si disturberebbero a vicenda durante la backpropagation. Le teste separate
+#   permettono a ogni output di ottimizzarsi indipendentemente.
+#
+# STRUTTURA DELLA BASE COMUNE:
+#   Linear(30→128) + LayerNorm + ReLU
+#   Linear(128→128) + LayerNorm + ReLU
+#   Linear(128→64)  + LayerNorm + ReLU
+#
+# PERCHÉ LayerNorm E NON BatchNorm?
+#   LayerNorm normalizza ogni singolo campione indipendentemente, funziona
+#   anche con batch piccoli e non richiede statistiche di popolazione.
 # =============================================================================
 class Actor(nn.Module):
     def __init__(self, input_size: int = INPUT_SIZE):
         super().__init__()
 
-        # Base condivisa: 3 layer densi con LayerNorm e ReLU
-        # Struttura: 30 → 128 → 128 → 64 neuroni
+        ## Base comune: tre layer lineari densi con normalizzazione per stabilizzare i gradienti 
+        # e funzione di attivazione non lineare ReLU (Se il segnale è negativo lo azzera (interruttore spento), 
+        # se è positivo lo fa passare invariato).
         self.base = nn.Sequential(
             nn.Linear(input_size, 128),
             nn.LayerNorm(128),
@@ -65,28 +81,31 @@ class Actor(nn.Module):
             nn.ReLU(),
         )
 
-        # 4 teste separate: ognuna calcola un singolo output continuo
+        # Teste separate: ognuna calcola un singolo valore output continuo 
         self.steer_head = nn.Linear(64, 1)  # sterzo
         self.accel_head = nn.Linear(64, 1)  # acceleratore
         self.brake_head = nn.Linear(64, 1)  # freno
-        self.gear_head  = nn.Linear(64, 1)  # marcia (normalizzata)
+        self.gear_head  = nn.Linear(64, 1)  # marcia 
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
+        # Propagazione attraverso la base comune
         features = self.base(state)
 
-        # Attivazioni di output per vincolare i range fisici:
+        # Ogni testa produce il proprio output con la propria funzione di attivazione:
+        # - tanh  per steer: range [-1.0, +1.0] (destra/sinistra)
+        # - sigmoid per accel/brake: range [0.0, 1.0] (rilasciato/pieno)
+        # - sigmoid per gear: range [0.0, 1.0] (normalizzato, sarà de-normalizzato a runtime)
         steer = torch.tanh(self.steer_head(features))    # [-1.0, +1.0]
         accel = torch.sigmoid(self.accel_head(features)) # [0.0, 1.0]
         brake = torch.sigmoid(self.brake_head(features)) # [0.0, 1.0]
-        gear  = torch.sigmoid(self.gear_head(features))  # [0.0, 1.0] → de-normalizzato dopo
+        gear  = torch.sigmoid(self.gear_head(features))  # [0.0, 1.0]   
 
-        # Restituisce tensore [batch, 4] con tutti e 4 i comandi
+        # Concatena i 4 output in un unico vettore [steer, accel, brake, gear]
         return torch.cat([steer, accel, brake, gear], dim=-1)
 
-
-# =============================================================================
-# PREPROCESSING DELLO STATO — identico a reinforce_optimization.py
-# =============================================================================
+# ======================================================================================
+# PREPROCESSING DELLO STATO — identico a reinforce_optimization.py e train_imitation.py
+# ======================================================================================
 # Converte il dizionario di sensori grezzi di TORCS in un vettore NumPy
 # normalizzato di 30 elementi, pronto per essere passato alla rete.
 #
@@ -94,10 +113,10 @@ class Actor(nn.Module):
 #   [0]     angle       / pi          → [-1, 1]
 #   [1]     gear        / 6.0         → [0, 1]
 #   [2]     rpm         / 10000       → [0, 1]
-#   [3-5]   speedX/Y/Z  / 200.0       → ~[-1, 1]
+#   [3-5]   speedX/Y/Z  / 200.0       → [-1, 1]
 #   [6-24]  track[0..18]/ 200.0       → [0, 1]  (19 sensori laser)
 #   [25]    trackPos    / 3.0         → [-0.33, 0.33]
-#   [26-29] wheelSpinVel/ 100.0       → [0, ~3]
+#   [26-29] wheelSpinVel/ 100.0       → [0, 1]
 #
 # PERCHÉ QUESTO ORDINE SPECIFICO?
 #   Deve essere identico all'ordine usato in train_imitation.py e
@@ -121,7 +140,6 @@ def preprocess_state(S: dict) -> np.ndarray:
 
     # np.concatenate unisce tutti i vettori in un unico array monodimensionale X ∈ R^30
     return np.concatenate([angle, gear, rpm, speed, track, track_pos, wheel])
-
 
 # =============================================================================
 # BLEND FACTOR — funzione di miscelazione spaziale α(s)
@@ -158,7 +176,6 @@ def compute_blend_factor(track_idx: float) -> float:
     # Rampa lineare di uscita (2750m → 2850m): alpha scende da 1 a 0
     return 1.0 - (track_idx - CORK_HARD_END) / CORK_BLEND_ZONE
 
-
 # =============================================================================
 # CARICAMENTO MODELLI
 # =============================================================================
@@ -169,14 +186,15 @@ def load_model(path: str, label: str) -> Actor:
             f"Modello '{label}' non trovato: {path}\n"
             f"Assicurati che il file esista nella directory corrente."
         )
+    # Dichiarazione Rete Neurale
     model = Actor(INPUT_SIZE)
-    # map_location="cpu": carica il modello sulla CPU anche se era stato
-    # salvato su GPU. Necessario per eseguire su macchine senza CUDA.
+    # map_location="cpu": carica il modello sulla CPU anche se era stato salvato su GPU.
+    # model.load_state_dict(...): Prende il dizionario di numeri appena estratto e lo "inietta" 
+    # dentro i layer della tua rete neurale. 
     model.load_state_dict(torch.load(path, map_location="cpu"))
     model.eval()  # disabilita dropout e BatchNorm in modalità training
     print(f"  [OK] {label}: {path}")
     return model
-
 
 # =============================================================================
 # FUNZIONE DI TEST PRINCIPALE
@@ -236,21 +254,39 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
                 relaunch = True
                 time.sleep(5.0)
 
-        # Stato iniziale del simulatore
-        obs              = env.client.S.d       # dizionario sensori TORCS
-        state            = preprocess_state(obs) # vettore NumPy normalizzato
-        start_dist_raced = obs.get('distRaced', 0.0)  # distanza percorsa a inizio episodio
-        done             = False
-        steps            = 0
-        max_dist         = 0.0       # distanza massima raggiunta (distFromStart)
-        dist_raced       = 0.0       # distanza percorsa nell'episodio
-        lap_completed    = False
-        crash_point      = None      # metro dove è avvenuto il crash
+        # =======================================
+        # STATO INIZIALE DEL SIMULATORE 
+        # =======================================
+        # Estrazione del dizionario dei sensori grezzi direttamente dal server TORCS.
+        # Contiene dati come velocità, angolo, distanze dai bordi (track), ecc.
+        obs              = env.client.S.d       
 
-        # Variabili di log per la zona Cork (non usate nell'output finale ma utili per debug)
-        cork_entry_speed   = None
-        cork_entry_logged  = False
-        critical_logged    = False
+        # Trasformazione dei dati grezzi in un vettore NumPy normalizzato pronto per la rete neurale.
+        # Questa funzione rimuove i dati inutili e scala gli altri per facilitare la convergenza.
+        state            = preprocess_state(obs) 
+
+        # Memorizzazione della distanza totale percorsa dall'auto dall'inizio della sua "vita" nel simulatore.
+        # Serve come punto di riferimento per calcolare quanti metri effettivi percorre in questo giro.
+        start_dist_raced = obs.get('distRaced', 0.0) 
+
+        # Flag booleano di controllo del loop: finché è False, l'auto continua a guidare.
+        done             = False
+
+        # Contatore dei fotogrammi (passi): serve per il limite di sicurezza (es. max 12.000 passi)
+        # per evitare che l'auto giri all'infinito se rimane incastrata a bassa velocità.
+        steps            = 0
+
+        # Distanza massima raggiunta (distFromStart)
+        max_dist         = 0.0    
+
+        # Distanza percorsa nell'episodio  
+        dist_raced       = 0.0    
+
+        # Flag booleano che indica se il giro è stato completato
+        lap_completed    = False
+
+        # Salva eventualmente il metro dove è avvenuto il crash
+        crash_point      = None  
 
         # =====================================================================
         # LOOP DI CONTROLLO — un'iterazione = un time step del simulatore
@@ -259,21 +295,26 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
             # Converte lo stato in tensore PyTorch [1, 30] (batch size 1)
             state_t   = torch.FloatTensor(state).unsqueeze(0)
 
-            # Legge la posizione sulla pista per calcolare il blend factor
+            # Legge la posizione sulla pista  
             track_idx = float(obs.get('distFromStart', 0.0))
+
+            # Calcola il coefficiente per il blend factor per capire quale modello utilizzare
             alpha     = compute_blend_factor(track_idx)
 
             # Aggiorna la distanza massima raggiunta
             max_dist = max(max_dist, track_idx)
 
             # ---- INFERENZA PARALLELA DEI DUE MODELLI ----
-            with torch.no_grad():  # disabilita il calcolo dei gradienti (non serve in test)
-                anchor_action = anchor(state_t).numpy()[0]     # output Golden Stable [4]
-                cork_action   = cork_actor(state_t).numpy()[0]  # output Cork Actor [4]
+            with torch.no_grad():  # disabilita il calcolo dei gradienti (ovvero non permette l'addestramento)
+                anchor_action = anchor(state_t).numpy()[0]      # output del modello IL
+                cork_action   = cork_actor(state_t).numpy()[0]  # output del modello RL
 
-            # ---- BLEND DETERMINISTICO (nessun rumore in test) ----
+            # ---- BLEND DETERMINISTICO ----
             # Formula: u_finale = (1-α)*u_IL + α*u_RL
-            # α=0 → 100% Golden Stable, α=1 → 100% Cork Actor
+            # COMPORTAMENTO:
+            #   α = 0.0 → 100% Golden Stable (Imitation Learning)   [fuori dal Corkscrew]
+            #   α = 1.0 → 100% Cork Actor (Reinforcement Learning)  [dentro il Corkscrew]
+            #   0 < α < 1 → blend lineare (zona di transizione, 100m alle soglie)
             blended = (1.0 - alpha) * anchor_action + alpha * cork_action
 
             # ---- COSTRUZIONE AZIONE FINALE ----
@@ -306,8 +347,10 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
             # Calcola la distanza percorsa dall'inizio dell'episodio
             dist_raced = obs.get('distRaced', 0.0) - start_dist_raced
             track_pos  = obs.get('trackPos', 0.0)
-
+            
+            # =====================================================================
             # ---- CONDIZIONI DI TERMINAZIONE DELL'EPISODIO ----
+            # =====================================================================
 
             # 1. GIRO COMPLETATO: dist_raced > 3610m (lunghezza pista Corkscrew)
             if dist_raced > 3610:
@@ -371,6 +414,7 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
     print("RIEPILOGO FINALE")
     print("=" * 65)
 
+    # Per ogni episodio stampa la sua terminazione
     for r in results:
         if r['completed']:
             status = f"✓ COMPLETO  lap={r['lap_time']:.2f}s"
@@ -380,7 +424,7 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
             status = f"✗ timeout a {r['max_dist']:.1f}m"
         print(f"  Ep {r['episode']:2d}: {status}")
 
-    # Statistiche di completamento e crash
+    # Stampa le statistiche di media tra tutti gli episodi completati
     completed = [r for r in results if r['completed']]
     crashes_before_cork = [r for r in results
                            if r['crash'] and r['crash'] < CORK_HARD_START]
@@ -401,14 +445,8 @@ def test_hybrid(anchor_path: str, cork_path: str, n_episodes: int):
     print(f"Distanza media max:   {avg_max:.1f}m")
     print(f"\nLog salvato in: {log_path}")
 
-
 # =============================================================================
 # ENTRY POINT — argomenti da linea di comando
-# =============================================================================
-# Utilizzo:
-#   python test_hybrid_v2.py                              → usa default
-#   python test_hybrid_v2.py --anchor mio_modello.pth    → modello custom
-#   python test_hybrid_v2.py --episodes 5                → 5 episodi
 # =============================================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

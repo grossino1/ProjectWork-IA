@@ -444,87 +444,102 @@ import csv
 import time
 import os
 
-# ================= USER CONFIGURABLE PARAMETERS =================
-# Queste variabili globali sono il "Setup" della tua auto. 
+# =====================================================================================
+# USER CONFIGURABLE PARAMETERS: Queste variabili globali sono il "Setup" dell' auto. 
 # Modificarle cambia il carattere della vettura senza toccare la matematica complessa.
+# =====================================================================================
+# Velocità massima assoluta che l'auto cercherà di raggiungere nei lunghi rettilinei.
+TARGET_SPEED = 300       
 
-TARGET_SPEED = 300       # Velocità massima assoluta che l'auto cercherà di raggiungere nei lunghi rettilinei.
-STEER_GAIN = 20          # Sensibilità dello sterzo: quanto bruscamente gira le ruote in base all'angolo della pista.
-CENTERING_GAIN = 0.1     # "Forza di attrazione" verso il centro. A 0.1 è debole, permettendo all'auto di allargarsi sui cordoli.
-BRAKE_THRESHOLD = 0.1    # (Non utilizzato in questo blocco, ma di solito indica una soglia di attivazione del freno)
-GEAR_SPEEDS = [0, 60, 95, 150, 230, 270]  # Le velocità (in km/h) a cui la macchina passa alla marcia successiva (1a, 2a, 3a, ecc.)
-ENABLE_TRACTION_CONTROL = True # Interruttore per attivare/disattivare il sistema anti-pattinamento.
+# Sensibilità dello sterzo: quanto bruscamente gira le ruote, più si aumenta più lo sterzo gira.
+STEER_GAIN = 20          
 
-# ================= HELPER FUNCTIONS =================
+# Forza di attrazione verso il centro. A 0.1 è debole, permettendo all'auto di allargarsi sui cordoli.
+CENTERING_GAIN = 0.1     
 
-def calculate_steering(S):
-    # --- STERZO DINAMICO ---
-    # Come nelle auto vere, a bassa velocità serve girare di più il volante per fare la curva.
+# Le velocità (in km/h) a cui la macchina passa alla marcia successiva (1a, 2a, 3a, ecc.)
+GEAR_SPEEDS = [0, 60, 95, 150, 230, 270] 
+
+# Interruttore per attivare/disattivare il sistema anti-pattinamento (TCS). 
+ENABLE_TRACTION_CONTROL = True 
+
+# =====================================================================================
+# HELPER FUNCTIONS: Servono per calcolare i valori di output da inviare a TORCS
+# =====================================================================================
+# --- 1. STERZO  ---
+def calculate_steering(S):    
+    # A bassa velocità serve girare di più il volante per fare la curva.
     dynamic_gain = STEER_GAIN
     if S['speedX'] < 80:
         # Se andiamo a meno di 80 km/h, aumentiamo la sensibilità dello sterzo del 50%.
-        # Questo aiuta tantissimo nei tornanti stretti come il Cavatappi.
+        # Questo aiuta tantissimo nei tornanti.
         dynamic_gain = STEER_GAIN * 1.5
 
-    # Formula dello sterzo:
+    # Formula dello sterzo: gira seguendo l'angolo della pista:
     # 1. (S['angle'] * dynamic_gain) -> Segue l'angolo della pista.
-    # 2. - (S['trackPos'] * CENTERING_GAIN) -> Piccola correzione per non finire sull'erba.
+    # 2. - (S['trackPos'] * CENTERING_GAIN) -> Piccola correzione per non finire sull'erba, cerca di rimanere centrale.
     steer = (S['angle'] * dynamic_gain / math.pi) - (S['trackPos'] * CENTERING_GAIN)
     
     # Assicuriamoci che il valore inviato al server sia tra -1.0 (tutto a destra) e 1.0 (tutto a sinistra).
     return max(-1.0, min(1.0, steer))
 
+# --- 2. PEDALI  ---
 def calculate_speed_logic(S):
+    # Prendo la velocità corrente a cui sta andando la macchina
     speed = S['speedX']
-    
     # --- PERCEZIONE VISIVA ---
-    # Invece di guardare solo un punto davanti (sensore 9), guardiamo un "ventaglio" di 5 sensori centrali.
+    # Invece di guardare solo un punto davanti (sensore 9), guardiamo un "ventaglio" di 9 sensori centrali.
     # Questo evita che l'auto freni per sbaglio se sbanda un attimo e il muso punta il muro.
     front_vision = S['track'][5:14]
-    max_dist_ahead = max(front_vision) # Prende la distanza libera più lunga disponibile davanti.
+    # Prende la distanza libera più lunga disponibile davanti.
+    max_dist_ahead = max(front_vision) 
 
     # --- CALCOLO VELOCITÀ IDEALE (SAFE SPEED) ---
-    # Regola base: Velocità Sicura = Distanza visibile moltiplicata per 2.
+    # Regola base: Velocità Sicura = Distanza visibile moltiplicata per 2.5
     # Esempio: Vedo a 150 metri -> Posso andare a 300 km/h. Vedo a 50 metri (curva vicina) -> Devo scendere a 100 km/h.
     safe_speed = max_dist_ahead * 2.5
     
     # Limitiamo la safe_speed per evitare comportamenti estremi:
-    # - Non scende mai sotto i 65 km/h (altrimenti si pianta in curva perdendo slancio).
+    # - Non scende mai sotto i 75 km/h (altrimenti si pianta in curva).
     # - Non supera mai la TARGET_SPEED massima (300 km/h).
     safe_speed = max(75.0, min(TARGET_SPEED, safe_speed))
 
     # --- CONTROLLO DEI PEDALI (PROPORZIONALE) ---
     accel = 0.0
     brake = 0.0
-    diff = safe_speed - speed # Calcola lo scarto tra quanto dovremmo andare e quanto stiamo andando.
+    # Calcola lo scarto tra quanto dovremmo andare e quanto stiamo andando.
+    diff = safe_speed - speed 
 
     if diff > 0:
         # SIAMO LENTI (diff è positivo) -> Dobbiamo accelerare
-        # Minore è la differenza, meno gas diamo (per evitare scatti), dividendo per 20.
+        # Minore è la differenza, meno gas diamo, dividendo per 20.
         accel = min(1.0, diff / 20.0) 
         
         # Spinta esplosiva: se andiamo a meno di 90 km/h, diamo il 100% di gas a prescindere.
-        # Serve a schizzare fuori dalle curve lente senza esitazioni.
+        # Serve a schizzare fuori dalle curve lente.
         if speed < 90: 
             accel = 1.0
     else:
         # SIAMO TROPPO VELOCI (diff è negativo) -> Dobbiamo frenare
         # Tolleranza: Ignoriamo piccole variazioni (fino a 10 km/h sopra il limite) per far scorrere la macchina
         # senza che tocchi continuamente i freni nei falsi allarmi.
+        # La funzione nativa abs() calcola il valore assoluto di un numero.
         if abs(diff) > 10:
             brake = min(1.0, (-diff) / 35.0) # (-diff) trasforma il numero in positivo per il pedale del freno.
 
     # --- PANIC BRAKE (SISTEMA DI EMERGENZA) ---
     # Se il sensore esattamente dritto (il 9) vede un muro a meno di 45 metri e stiamo andando forte (>80km/h),
-    # ignora tutti i calcoli dolci e INCHIODA (freno al 100%).
+    # ignora tutti i calcoli e inchiodiamo (freno al 100%).
     if S['track'][9] < 45 and speed > 80:
         brake = 1.0
 
     return accel, brake
 
+ # --- 3. CAMBIO MARCE---
 def shift_gears(S):
-    # --- CAMBIO MARCE ---
+    # Inizializzo la marcia base
     gear = 1
+    # Prendo la velocità corrente a cui sta andando la macchina
     speed = S['speedX']
     # Controlla la nostra velocità contro la lista GEAR_SPEEDS definita in alto.
     # Scala le marce dinamicamente se la velocità scende (aiuta anche il freno motore).
@@ -533,15 +548,14 @@ def shift_gears(S):
             gear = i + 1
     return gear
 
+# --- CONTROLLO TRAZIONE (TCS): Serve per aiutare il bot a non far slittare le ruote in accellerazione ---
 def traction_control(S, accel):
-    # --- CONTROLLO TRAZIONE (TCS) ---
     if ENABLE_TRACTION_CONTROL:
         # Calcola quanto slittano le ruote (Rotazione ruote posteriori meno rotazione ruote anteriori).
         slip = (S['wheelSpinVel'][2] + S['wheelSpinVel'][3]) - (S['wheelSpinVel'][0] + S['wheelSpinVel'][1])
-        
-        # Se le ruote dietro girano molto più a vuoto di quelle davanti (>5)...
+
+        # Se le ruote posteriori girano molto più a vuoto di quelle anteriori (>5), taglia la potenza dell'accellereratore (-0.3) per far riprendere aderenza alle gomme.
         if slip > 5:
-            # ...taglia la potenza del motore (-0.3) per far riprendere aderenza alle gomme.
             accel -= 0.3
             
     # Assicura che l'acceleratore non diventi mai un numero negativo.
@@ -549,28 +563,27 @@ def traction_control(S, accel):
 
 # ================= MAIN DRIVE FUNCTION =================
 def drive_modular(c):
-    # Estrae i Sensori (S) e i Comandi da inviare (R)
+    # 1. Estrae i Sensori (S - Input) e i Comandi da inviare (R - Output)
     S, R = c.S.d, c.R.d
     
-    # 1. Chiede alla funzione helper quanto girare il volante.
+    # 2. Chiede alla funzione helper quanto girare il volante.
     R['steer'] = calculate_steering(S)
     
-    # 2. Chiede alla funzione helper quanto gas o freno dare.
+    # 3. Chiede alla funzione helper quanto gas o freno dare.
     accel, brake = calculate_speed_logic(S)
     
-    # --- 3. TRAIL BRAKING FISICO ---
-    # Concetto avanzato di corsa: se sterzo molto, devo frenare di meno, altrimenti le gomme anteriori 
-    # si bloccano (sottosterzo) e la macchina va dritta.
-    # Qui sottraiamo fino al 50% della pressione del freno in base a quanto è girato il volante.
+    # 4. --- TRAIL BRAKING FISICO (ABS): Serve per aiutare il bot a non far bloccare le ruote in frenata ---
+    # Se sterzo molto, devo frenare di meno, altrimenti le gomme si bloccano e la macchina va dritta.
+    # Qui sottraiamo fino al 50% della pressione del freno in base a quanto è girato il volante; più il volante è dritto più la frenata non crea bloccaggio.
     brake = brake * (1.0 - (abs(R['steer']) * 0.5))
 
-    # 4. Applica l'acceleratore, passandolo prima attraverso il filtro anti-pattinamento (TCS).
+    # 5. Applica l'acceleratore, passandolo prima attraverso il filtro (TCS).
     R['accel'] = traction_control(S, accel)
     
-    # 5. Applica il freno definitivo (assicurandosi sia tra 0 e 100%).
+    # 6. Applica il freno definitivo (assicurandosi sia tra 0 e 100%).
     R['brake'] = max(0.0, min(1.0, brake))
     
-    # 6. Cambia la marcia.
+    # 7. Cambia la marcia.
     R['gear'] = shift_gears(S)
     
     # --- 7. SICUREZZA FINALE ---
@@ -581,88 +594,136 @@ def drive_modular(c):
         
     return
 
-# ================= MAIN LOOP CON APPEND E FLAG DI RESET =================
-# ================= MAIN LOOP CON APPEND, FLAG DI RESET E FRAME SKIPPING =================
+# ===========================================================================
+# MAIN LOOP  
+# ===========================================================================
 if __name__ == "__main__":
-    # from snakeoil3_jm2 import Client # (Decommenta se serve importare Client qui)
-    
+    # Prendo l'istanza che mi permette di parlare con TORCS
     C = Client(p=3001) 
+    # Definisco il nome del Dataset dove salvare l'esecuzione
     dataset_filename = "dataset_bot_154_clean.csv"
     
-    # 1. Controlliamo se il file esiste già prima di aprirlo
+    # Controlliamo se il file esiste già prima di aprirlo
     file_exists = os.path.isfile(dataset_filename)
     
-    # 2. Apriamo in modalità 'a' (Append). Se non esiste, lo crea.
+    # Apriamo in modalità 'a' (Append). Se non esiste, lo crea.
     csv_file = open(dataset_filename, "a", newline='')
     csv_writer = csv.writer(csv_file)
 
-    # --- LA NOSTRA BLACKLIST CORRETTA ---
-    # NOTA: Ho tolto 'distRaced', 'distFromStart' e 'curLapTime' da qui. 
-    # DEVONO essere salvati nel CSV per permettere all'IA di capire quando inizia un giro.
+    # --- LA NOSTRA BLACKLIST: I sensori da non salvare perché inutili alla nostra causa --- 
     KEYS_TO_IGNORE = [
         'opponents', 'focus', 'fuel', 'damage', 'z', 
         'lastLapTime', 'racePos'
     ]
     
-    # Se il file esisteva già, non dobbiamo riscrivere gli header
+    # Se il file esisteva già, non dobbiamo riscrivere gli header (intestazioni delle colonne)
     headers_written = True if file_exists else False
-    
     print(f"--- LOGGING BOT ATTIVO: {'Accodamento dati (Append)' if file_exists else 'Nuovo file creato'} ---")
     print("Tracciamento telemetrico 'distRaced' per partenze da fermo: ATTIVATO")
     print("Frame Skipping: ATTIVATO (Salvataggio a 10 Hz)")
     
+    # ===========================================================================
+    # INIZIALIZZAZIONE DEGLI ACCUMULATORI
+    # ===========================================================================
+    # Contatore progressivo dei fotogrammi (step) eseguiti in questa specifica sessione
     step_count = 0
+
+    # Ancora temporale iniziale: serve per calcolare il timestamp relativo di ogni riga
     t0 = time.time()
+
+    # Memoria della distanza progressiva del passo precedente per intercettare i reset della pista
     last_dist_raced = 0.0  
-    
-    # --- IMPOSTAZIONE FRAME SKIPPING ---
-    LOG_INTERVAL = 5 # Registra 1 frame ogni 5 (Riduce il file dell'80%)
-    
+
+    # STRATEGIA DI DOWNSAMPLING (FRAME SKIPPING): Scrive nel CSV solo 1 fotogramma ogni 5.
+    # Riduce il peso del dataset dell'80% ed elimina i dati quasi identici (ridondanza statistica).
+    LOG_INTERVAL = 5 
+
+    # ===========================================================================
+    # CICLO PRINCIPALE DI GUIDA ED ESTRAZIONE TELEMETRIA (PIPELINE IMITATION LEARNING)
+    # ===========================================================================
     try:
+        # Ciclo a ritroso dal numero massimo di step consentiti fino a zero
         for step in range(C.maxSteps, 0, -1):
+            
+            # Ricezione UDP: Cattura i dati freschi dei sensori provenienti dal server TORCS
             C.get_servers_input()  
+            
+            # Esecuzione della logica di controllo (il Bot pilota la macchina e decide i comandi)
             drive_modular(C)       
             
             # --- RICONOSCIMENTO PARTENZE / RESET IN TEMPO REALE ---
+            # Recupera la distanza totale percorsa da inizio simulazione
             current_dist = C.S.d.get('distRaced', 0.0)
+            
+            # Se la distanza corrente è inferiore a quella del passo precedente di oltre 10 metri,
+            # significa che l'utente ha premuto "Reset". Isola l'evento per evitare dati corrotti.
             if current_dist < last_dist_raced - 10: 
                 print("\n[!] ---> PARTENZA DA FERMO RILEVATA (Dati separati con successo) <---")
+                
+            # Aggiorna la memoria dello storico per il controllo del prossimo frame
             last_dist_raced = current_dist
 
-            # --- LOGICA SALVATAGGIO ---
+            # --- COSTRUZIONE DINAMICA DELL'INTESTAZIONE CSV (Solo al primo passo) ---
             if not headers_written:
+                # I primi 5 campi saranno i TARGET (le Y del modello: tempo e comandi attuati)
                 headers = ["timestamp", "target_steer", "target_accel", "target_brake", "target_gear"]
+                
+                # Scansione ordinata alfabeticamente di tutti i sensori presenti nel server TORCS
                 for key, value in sorted(C.S.d.items()):
-                    if key in KEYS_TO_IGNORE: continue
+                    if key in KEYS_TO_IGNORE: continue  # Salta i dati inutili (es. info di debug)
+                    
+                    # Se il sensore è un vettore (es. i 19 laser del 'track' o i 36 di 'opponents'),
+                    # "appiattisce" la struttura creando colonne separate (track_0, track_1, etc.)
                     if isinstance(value, list):
                         for i in range(len(value)): headers.append(f"{key}_{i}")
-                    else: headers.append(key)
+                    else:
+                        headers.append(key) # Se è un valore singolo (es. speedX), crea una colonna standard
+                
+                # Scrittura fisica della riga dei titoli nel file CSV
                 csv_writer.writerow(headers)
                 headers_written = True
 
+            # --- COMPILAZIONE DELLA RIGA DATI (IL DATA POINT) ---
+            # Calcola il tempo trascorso dall'inizio del logging (asse X temporale)
             current_time = time.time() - t0
+            
+            # Inserisce per primi i dati di controllo correnti generati dal pilota (Target)
             row = [current_time, C.R.d['steer'], C.R.d['accel'], C.R.d['brake'], C.R.d['gear']]
             
+            # Inserisce in coda tutti i valori dei sensori associati (Input/Features per la rete)
             for key in sorted(C.S.d.keys()):
                 if key in KEYS_TO_IGNORE: continue
                 val = C.S.d[key]
-                if isinstance(val, list): row.extend(val)
+                if isinstance(val, list): row.extend(val) # Scompatta le liste dei vettori laser
                 else: row.append(val)
             
+            # Incrementa il contatore dei passi eseguiti
             step_count += 1
             
-            # --- SCRITTURA OTTIMIZZATA NEL CSV (FRAME SKIPPING) ---
+            # --- SCRITTURA OTTIMIZZATA NEL CSV (APPLICAZIONE FRAME SKIPPING) ---
+            # Salva la riga sul disco solo se il passo corrente è un multiplo di 5 (LOG_INTERVAL)
             if step_count % LOG_INTERVAL == 0:
                 csv_writer.writerow(row)
             
+            # Telemetria testuale di monitoraggio in tempo reale ogni 100 passi di guida
             if step_count % 100 == 0:
                 print(f"Step sessione: {step_count} | Vel: {int(C.S.d['speedX'])} km/h | Distanza: {int(current_dist)}m")
 
+            # Spedisce i comandi attuali a TORCS via UDP e chiude il passo di simulazione
             C.respond_to_server()  
             
+    # ===========================================================================
+    # GESTIONE DELLE INTERRUZIONI E CHIUSURA IN SICUREZZA DELLO SCRIPT
+    # ===========================================================================
     except KeyboardInterrupt:
+        # Gestisce la chiusura manuale da tastiera (CTRL+C) evitando dump di errore rossi a schermo
         print("\nSessione terminata dall'utente. Nessun dato perso.")
+
     finally:
+        # Blocco di sicurezza assoluto: viene eseguito sempre, anche in caso di crash fatale del codice.
+        # Chiude il canale di scrittura sul file CSV salvando il buffer su disco rigido
         csv_file.close()
+        
+        # Interrompe la connessione socket UDP con il simulatore TORCS liberando le porte di rete
         C.shutdown()
         print(f"Dati salvati e accodati in: {dataset_filename}")

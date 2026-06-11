@@ -31,7 +31,6 @@ BATCH_SIZE = 64
 EPOCHS = 150
 LEARNING_RATE = 0.001
 
-
 # =============================================================================
 # ARCHITETTURA DELLA RETE NEURALE — ExpertModel (Multi-Head)
 # =============================================================================
@@ -96,7 +95,6 @@ class ExpertModel(nn.Module):
         #l'ordine dei sensori messi nel CSV, perchè Il modello capisce qual è la testa del freno solo perché noi l'abbiamo collegata matematicamente alla colonna del freno nel tuo file dei dati.
         return torch.cat([steer, accel, brake, gear], dim=-1)
 
-
 # =============================================================================
 # FUNZIONE DI TRAINING PRINCIPALE
 # =============================================================================
@@ -120,8 +118,7 @@ def train():
     # STRUTTURA DEL CSV (colonne):
     #   col 0:      timestamp
     #   col 1-4:    target_steer, target_accel, target_brake, target_gear  ← OUTPUT (Y)
-    #   col 5-34:   sensori TORCS (angle, gear, rpm, speedX/Y/Z, track×19,
-    #               trackPos, wheelSpinVel×4)                              ← INPUT (X)
+    #   col 5-34:   sensori TORCS (angle, gear, rpm, speedX/Y/Z, track×19, trackPos, wheelSpinVel×4) ← INPUT (X)
 
     # Separa input (X) e output (Y) in due matrici NumPy a precisione singola
     y = data.iloc[:, 1:5].values.astype(np.float32)   # comandi del pilota, prende le righe dalla 1 alla 4
@@ -169,14 +166,19 @@ def train():
     #prende dal dateset 64 (batch size) righe per volta in maniera casuale.
 
     # -------------------------------------------------------------------------
-    # FASE 3: SETUP MODELLO E OTTIMIZZATORE
+    # FASE 3: SETUP MODELLO E OTTIMIZZATORE:
+    # # Con queste tre righe avete materialmente messo in pista la macchina (model), stabilito che l'obiettivo è azzerare lo scarto quadratico rispetto all'uomo 
+    # (criterion) e ingaggiato l'algoritmo matematico più efficiente sul mercato per correggere i neuroni a ogni errore commesso (optimizer).
     # -------------------------------------------------------------------------
     model     = ExpertModel(input_dim)   # con questo comando creiamo la rete neurale che è pronta ad entrare nel training loop
     criterion = nn.MSELoss()             # usato solo come riferimento, vedi sotto
+    
+    # optim è il modulo di PyTorch (torch.optim) che contiene tutti gli algoritmi di ottimizzazione. In questo caso stai istanziando Adam (Adaptive Moment Estimation)
+    # A differenza del Gradiente Discendente classico (SGD), che scende lungo la Loss a velocità costante, Adam è un algoritmo intelligente e adattivo:
+    #   - Usa la "Frenata d'Inerzia" (Momentum): Se capisce che sta andando nella direzione giusta per azzerare l'errore, accelera l'aggiornamento dei pesi.
+    #   - Adatta il passo per ogni singolo neurone: Se un neurone riceve aggiornamenti continui e caotici, Adam gli riduce il passo per stabilizzarlo; se un neurone è quasi "addormentato", gli aumenta il passo per farlo svegliare.
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    # Con queste tre righe avete materialmente messo in pista la macchina (model), stabilito che l'obiettivo è azzerare lo scarto quadratico rispetto all'uomo 
-    # (criterion) e ingaggiato l'algoritmo matematico più efficiente sul mercato per correggere i neuroni a ogni errore commesso (optimizer).
-
+    
     # -------------------------------------------------------------------------
     # FASE 4: TRAINING LOOP CON WEIGHTED MSE LOSS (LOSS ASIMMETRICA)
     # -------------------------------------------------------------------------
