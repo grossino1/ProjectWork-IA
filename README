@@ -2,6 +2,6 @@ Il modello si basa sull'utilizzo di due ''cervelli'':
 Il primo - actor_GOLDEN_STABLE.pth , è in grado di arrivare fino al cavatappi ma non sa completarla (crash costante a 2477.7m)
 Il secondo- actor_CASO2_best_dist.pth , è in grado di completare il cavatappi 
 
-Lo script test_hybrid_v2.py utilizza il primo fino al cavatappi, poi passa al secondo SOLO durante la chicane (fino a +400m)
+Lo script test.py utilizza il primo fino al cavatappi, poi passa al secondo SOLO durante la chicane (fino a +400m)
 
 Riesce a completare tutti i giri a ogni esecuzione (1.20)
